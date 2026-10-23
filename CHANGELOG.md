@@ -11,6 +11,11 @@ All notable changes are recorded here. The format follows [Keep a Changelog](htt
 - The canary collection is created with `min(3, node_count)` replicas, so node loss no longer takes part of it down and the `replace-node.sh` health gate can pass.
 - `cluster-peers-missing` did not detect a stopped node (Qdrant keeps it in the member list). Nodes now probe each peer's `/readyz`, published as `ReadyPeers`, and the alarm is `cluster-peers-not-ready`.
 
+### Changed
+
+- `scripts/replace-node.sh` also refuses to replace a node if, while it is gone, some shard would have fewer Active replicas than its write consistency factor (override with `ALLOW_WRITE_UNAVAILABILITY=1`).
+- `docs/multitenancy.md`: point IDs must be integers or UUIDs generated on the server; ID-based operations need server-side ownership checks because they cannot carry a tenant filter; custom shard keys can have several shards and replicas on several nodes (only tiered fallback and promoted keys are single-shard); separate collections do not isolate CPU or I/O; promotion setup steps and keeping the fallback copy until replicas are verified.
+
 ### Added
 
 - `production_mode`: enforces 3+ nodes spread so losing any AZ keeps a Raft majority, TLS on the NLB, backups and monitoring, an alarm destination, a pinned AMI, final snapshots and a secret recovery window. Defaults new collections to replication factor 3 and write consistency 2.

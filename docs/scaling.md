@@ -33,7 +33,7 @@ Use this when RAM, CPU or disk is the limit. It needs no data movement.
 **Larger instance type**
 
 1. Change `instance_type` and run `terraform apply`. This creates a new launch template version only. Running instances are untouched, so there is no surprise outage.
-2. Replace nodes **one at a time** with `scripts/replace-node.sh`. Set `QDRANT_URL` (the NLB endpoint) and `QDRANT_API_KEY`. Before each node the script checks that the cluster has enough peers and every collection has all its replicas Active at replication factor 2 or more; after each node it waits until the cluster is healthy again, and it stops at the first failure. The replacement re-attaches the node's ENI and data volume.
+2. Replace nodes **one at a time** with `scripts/replace-node.sh`. Set `QDRANT_URL` (the NLB endpoint) and `QDRANT_API_KEY`. Before each node the script checks that the cluster has enough peers, that every collection has all its replicas Active at replication factor 2 or more, and that losing the node still leaves every shard with at least `write_consistency_factor` Active replicas (so writes keep working); after each node it waits until the cluster is healthy again, and it stops at the first failure. The replacement re-attaches the node's ENI and data volume.
    - Single node: expect a few minutes of downtime while the instance replaces.
    - Cluster: before each replacement, confirm every collection shows all replicas `Active` (`GET /collections/{name}/cluster`), then wait for the node to rejoin before touching the next.
 3. Check the CloudWatch dashboard for memory and CPU after the change.

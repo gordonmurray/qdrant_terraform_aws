@@ -9,9 +9,9 @@ Everything below follows Qdrant's multitenancy and security documentation for th
 | Model | Use it when | Trade-offs |
 | --- | --- | --- |
 | **Shared collection, tenant in the payload** (default choice) | Many small and medium tenants | Best resource use. Isolation is only as good as the tenant filter your backend adds to every request. One tenant's heavy queries share CPU and disk with everyone |
-| **Custom shard keys** (one shard key per tenant, or per group of tenants) | You want a tenant's data on its own shard, to move or size it | Needs `sharding_method: custom`. A shard sits on one node, so a hot tenant cannot be spread by adding nodes |
+| **Custom shard keys** (one shard key per tenant, or per group of tenants) | You want a tenant's data on its own shard, to move or size it | Needs `sharding_method: custom`. A shard key can have several shards, and replicas of a shard can live on different nodes. In the tiered setup below, fallback and promoted keys are limited to one shard, so such a tenant cannot be partitioned across nodes |
 | **Tiered: fallback shard plus promoted tenants** (Qdrant 1.16+) | Many small tenants, a few that grow large | Small tenants share one fallback shard (so one node). Large tenants are promoted to their own shard. See the constraints below |
-| **Collection per tenant** | A small number of large tenants that need different settings or stronger separation | Each collection has fixed overhead. Qdrant recommends against thousands of collections |
+| **Collection per tenant** | A small number of large tenants that need different settings or stronger separation | Each collection has fixed overhead, and Qdrant recommends against thousands of collections. It separates authorization and configuration, **not CPU or disk I/O**: all collections on a node still share its resources |
 | **Dedicated cluster per tenant** | Contractual or regulatory isolation, or a very large tenant | The strongest isolation and the highest operating cost. Deploy another copy of this module |
 
 Start with a shared collection. Move a tenant to its own shard or collection when measurements show it is dominating a node.
@@ -30,11 +30,13 @@ curl -X PUT "$QDRANT_URL/collections/shared/index" -H "api-key: $QDRANT_API_KEY"
   -d '{"field_name": "tenant_id", "field_schema": {"type": "keyword", "is_tenant": true}}'
 ```
 
-The index makes Qdrant store each tenant's vectors close together, which speeds up filtered search. **It is not access control.** Your backend must add `{"must": [{"key": "tenant_id", "match": {"value": "<tenant>"}}]}` to every search, scroll, count, update and delete, and must never let a client choose the tenant.
+The index makes Qdrant store each tenant's vectors close together, which speeds up filtered search. **It is not access control.** Your backend must add `{"must": [{"key": "tenant_id", "match": {"value": "<tenant>"}}]}` to every operation that accepts a filter (search and query, scroll, count, delete by filter, set payload by filter), and must never let a client choose the tenant.
+
+Operations that take **point IDs** (retrieve, upsert, delete by IDs, recommend or query with example IDs) cannot carry a tenant filter. For those, your backend must check on the server that every ID belongs to the caller's tenant before it acts, including IDs referenced inside batch and recommendation requests.
 
 Rules that prevent most tenant mix-ups:
 
-- Point IDs are unique per collection, not per tenant. Prefix them with the tenant (for example a UUID derived from tenant and document ID), or one tenant can overwrite another's point by sending the same ID.
+- Point IDs are unique per collection, not per tenant, and Qdrant only accepts unsigned integers or UUIDs, so you cannot prefix an ID with a tenant name. Generate IDs on the server (for example a name-based UUID derived from the tenant and the document ID) and never accept a client-chosen ID, or one tenant can overwrite another's point by sending the same ID.
 - Reject any payload write that changes `tenant_id`.
 - Add a payload index for every other field you filter on.
 
@@ -54,17 +56,17 @@ curl -X PUT "$QDRANT_URL/collections/tenants/shards" -H "api-key: $QDRANT_API_KE
 
 Send `"shard_key": "tenant_a"` with writes and searches so the request only touches that shard.
 
-**Tiered multitenancy (1.16+)** keeps small tenants on a shared `default` shard and promotes a tenant to its own shard when it grows. Requests use `"shard_key": {"fallback": "default", "target": "tenant_a"}` plus the tenant filter. To promote a tenant:
+**Tiered multitenancy (1.16+)** keeps small tenants on a shared `default` shard and promotes a tenant to its own shard when it grows. Set it up first: create the collection as above, create the tenant payload index from section 2, and create the fallback shard with `PUT /collections/tenants/shards` and `{"shard_key": "default", "shards_number": 1}`. Requests then use `"shard_key": {"fallback": "default", "target": "tenant_a"}` plus the tenant filter. To promote a tenant:
 
 1. Create its shard in `Partial` state: `PUT /collections/tenants/shards` with `{"shard_key": "tenant_a", "shards_number": 1, "replication_factor": 1, "initial_state": "Partial"}`.
 2. Copy its points: `POST /collections/tenants/cluster` with `{"replicate_points": {"filter": {"must": {"key": "tenant_id", "match": {"value": "tenant_a"}}}, "from_shard_key": "default", "to_shard_key": "tenant_a"}}`.
-3. Once the shard is Active, routing follows it. Delete the tenant's points from the fallback shard, then **add replicas** to the new shard to restore your replication factor.
+3. Once the shard is Active, routing follows it. **Add replicas** to the new shard to restore your replication factor, wait until they are Active, and verify the tenant's point counts and a sample of queries. Only then delete the tenant's points from the fallback shard. Keeping the fallback copy until then means a failure during promotion loses nothing.
 
 Qdrant's documented constraints: fallback and dedicated shards use one shard each (`shards_number` 1); a new dedicated shard starts at replication factor 1; all small tenants share one shard and therefore one node; keep dedicated shards to roughly 1,000 per cluster; promote around 20,000 points.
 
 What this means for operations on this module:
 
-- **Adding nodes does not spread a shard.** A tenant's single shard stays on one node. Size that node for the largest tenant, or move the shard to a bigger instance's node.
+- **Adding nodes does not partition a promoted tenant.** A fallback or promoted key has one shard, so one tenant's data is not split across nodes (its replicas can be on other nodes). Size nodes for the largest tenant, or move that shard to a bigger instance's node.
 - **Promotion temporarily lowers redundancy** (replication factor 1). The `replica-deficit` alarm will fire until you add replicas. Treat that as expected during a promotion and finish quickly.
 - **The canary under-detects shard loss in custom-sharded collections.** For `sharding_method: custom` it counts only shards it can see; it cannot know which shard keys should exist. Keep your own list of expected shard keys and check it (**verify** how the shard list reports keys on your version).
 - **The backup restore procedure in [backup-restore.md](backup-restore.md) has not been validated for custom-sharded collections.** Drill it first.
@@ -73,7 +75,7 @@ What this means for operations on this module:
 
 The primary and read-only API keys are **global**: anyone holding one can read or write every collection. Keep them in your backend and operations tooling, never in tenant-facing code.
 
-Set `jwt_rbac_enabled = true` to turn on Qdrant's JWT role-based access control. Your backend then signs short-lived tokens (HS256, signed with the primary API key) with an `exp` claim and an `access` claim listing the collections and levels (`r` or `rw`) the token may use, for example `{"access": [{"collection": "tenants", "access": "r"}], "exp": 1766055305}`. Clients send it as `Authorization: Bearer <token>`.
+Set `jwt_rbac_enabled = true` to turn on Qdrant's JWT role-based access control. Your backend then signs short-lived tokens (HS256, signed with the primary API key) with an `exp` claim and an `access` claim listing the collections and levels (`r` or `rw`; newer versions define finer levels, so check the RBAC section of the Qdrant docs for your pinned version) the token may use, for example `{"access": [{"collection": "tenants", "access": "r"}], "exp": 1766055305}`. Clients send it as `Authorization: Bearer <token>`.
 
 Limits you need to design around:
 

@@ -23,6 +23,9 @@
 #   ALLOW_SMALL_CLUSTER=1   Allow clusters with fewer than 3 peers (single node
 #                       replacement means downtime).
 #   ALLOW_SINGLE_REPLICA=1  Allow collections with replication factor 1.
+#   ALLOW_WRITE_UNAVAILABILITY=1  Allow replacing a node even if, while it is gone,
+#                       some shard would have fewer Active replicas than the
+#                       collection's write consistency factor (writes to it would fail).
 #   HEALTH_TIMEOUT_MIN  Minutes to wait for the cluster to be healthy after each
 #                       replacement (default 30).
 #
@@ -58,8 +61,14 @@ api() { curl -fsS --max-time 30 -H "api-key: $QDRANT_API_KEY" "$QDRANT_URL$1"; }
 # Prints a human-readable problem and returns non-zero if the cluster is not
 # fully healthy: every peer present, every shard at its full replication factor
 # with all replicas Active, no collection running with a single replica.
+# With a first argument of "preflight" it also requires that the cluster can lose
+# one node: every shard must keep at least write_consistency_factor Active
+# replicas without it.
+# Note: this checks cluster membership and replica states as Qdrant reports them.
+# It cannot probe each node's readiness from outside the VPC; Qdrant only marks a
+# replica non-Active after it fails. Wait for the alarms to be clear as well.
 cluster_problem() {
-  local peers collections name path cfg rf sn
+  local mode="${1:-}" peers collections name path cfg rf wcf sn min_active
   curl -fsS --max-time 10 "$QDRANT_URL/readyz" >/dev/null 2>&1 || { echo "cluster endpoint is not ready"; return 1; }
 
   peers=$(api /cluster | jq -e '.result.peers | length') || { echo "cannot read cluster membership"; return 1; }
@@ -76,6 +85,7 @@ cluster_problem() {
     path=$(jq -rn --arg n "$name" '$n | @uri')
     cfg=$(api "/collections/$path") || { echo "cannot read collection $name"; return 1; }
     rf=$(jq -e '.result.config.params.replication_factor // 1' <<<"$cfg") || return 1
+    wcf=$(jq -e '.result.config.params.write_consistency_factor // 1' <<<"$cfg") || return 1
     sn=$(jq -e 'if .result.config.params.sharding_method == "custom" then 0 else (.result.config.params.shard_number // 0) end' <<<"$cfg") || return 1
     if [ "$rf" -lt 2 ] && [ "${ALLOW_SINGLE_REPLICA:-0}" != 1 ]; then
       echo "collection $name has replication factor $rf; replacing a node would make its data unavailable (set ALLOW_SINGLE_REPLICA=1 to accept that)"
@@ -90,6 +100,15 @@ cluster_problem() {
           | $present + $absent
         else error("no shard list") end') || { echo "cannot inspect shards of $name"; return 1; }
     [ "$deficit" -eq 0 ] || { echo "collection $name is $deficit replica(s) short of its replication factor"; return 1; }
+    if [ "$mode" = preflight ] && [ "${ALLOW_WRITE_UNAVAILABILITY:-0}" != 1 ]; then
+      min_active=$(api "/collections/$path/cluster" | jq -e '
+          [.result.local_shards[], (.result.remote_shards // [])[]]
+          | group_by(.shard_id) | map([.[] | select(.state == "Active")] | length) | min // 0') || { echo "cannot inspect shards of $name"; return 1; }
+      if [ $((min_active - 1)) -lt "$wcf" ]; then
+        echo "collection $name has a shard with only $min_active Active replica(s) and write consistency factor $wcf: while one node is replaced, writes to it would fail (set ALLOW_WRITE_UNAVAILABILITY=1 to accept that)"
+        return 1
+      fi
+    fi
   done <<<"$collections"
   return 0
 }
@@ -123,7 +142,7 @@ for asg in "${asgs[@]}"; do
   if [ "$skip_preflight" = 1 ]; then
     echo "Skipping preflight checks (--skip-preflight)."
   else
-    if ! problem=$(cluster_problem); then
+    if ! problem=$(cluster_problem preflight); then
       echo "Preflight failed, not replacing $asg: $problem" >&2
       exit 1
     fi
