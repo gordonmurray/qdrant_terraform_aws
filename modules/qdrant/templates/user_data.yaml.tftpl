@@ -13,12 +13,16 @@ write_files:
 %{ endfor ~}
 
 runcmd:
+%{ if install_packages ~}
   # The network (NAT) can lag behind instance launch, so retry the install.
   - |
-    for attempt in $(seq 1 20); do
-      dnf install -y docker jq xfsprogs%{ if monitoring } amazon-cloudwatch-agent%{ endif } && break
+    installed=0
+    for _ in $(seq 1 20); do
+      dnf install -y docker jq xfsprogs%{ if monitoring } amazon-cloudwatch-agent%{ endif } && { installed=1; break; }
       sleep 15
     done
+    [ "$installed" = 1 ] || exit 1
+%{ endif ~}
   - sysctl --system
   - systemctl daemon-reload
   - systemctl enable --now docker

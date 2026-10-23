@@ -20,7 +20,7 @@ resource "aws_lb" "this" {
   subnets                          = var.subnet_ids
   security_groups                  = [aws_security_group.nlb[0].id]
   enable_cross_zone_load_balancing = true
-  enable_deletion_protection       = false
+  enable_deletion_protection       = coalesce(var.nlb_deletion_protection, var.production_mode)
 
   tags = local.tags
 }

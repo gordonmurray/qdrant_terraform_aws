@@ -1,5 +1,7 @@
 # Operations runbook
 
+For node replacement, first configure the maintenance lock and target checks in [the migration guide](hardening-migration.md#replace-nodes).
+
 ## Connecting
 
 There is no SSH and no key pair. Use AWS Systems Manager Session Manager (needs the Session Manager plugin for the AWS CLI).
@@ -47,7 +49,7 @@ On start, the node attaches its own ENI and data volume. That is what lets the A
 1. Read the release notes for every version you skip. Qdrant supports upgrading one minor version at a time; do not skip minors.
 2. Take a fresh snapshot (`sudo systemctl start qdrant-snapshot.service`) and confirm it succeeded.
 3. Change `qdrant_version` and apply. This creates a new launch template version only.
-4. Replace nodes with `scripts/replace-node.sh asg-0 asg-1 asg-2`, one at a time. It needs `QDRANT_URL` and `QDRANT_API_KEY`, refuses to start if the cluster cannot afford to lose a node, waits for full replica health after each node, and stops at the first failure.
+4. Replace nodes with `scripts/replace-node.sh asg-0 asg-1 asg-2`, one at a time. It needs `QDRANT_URL`, `QDRANT_API_KEY`, `REPLACEMENT_LOCK_TABLE`, and `QDRANT_TARGET_GROUP_ARNS`, refuses to start if the cluster cannot afford to lose a node, waits for full replica health after each node, and stops at the first failure.
 
 Version 1.20 turns internal (node-to-node) authentication on by default when an API key is set. The module always sets an API key on all nodes from the same secret, so this works out of the box.
 
@@ -65,7 +67,7 @@ If you let the module manage the secret, edit the secret value in Secrets Manage
 
 ## Patching the OS
 
-Replace nodes with `scripts/replace-node.sh` (it needs `QDRANT_URL` and `QDRANT_API_KEY`). With the default `ami_id = null`, each replacement resolves the latest Amazon Linux 2023 AMI. Set `ami_id` to pin an AMI you have tested.
+Replace nodes with `scripts/replace-node.sh` (with the environment variables from the migration guide). With the default `ami_id = null`, each replacement resolves the latest Amazon Linux 2023 AMI. Set `ami_id` to pin an AMI you have tested.
 
 ## Qdrant metrics in CloudWatch
 

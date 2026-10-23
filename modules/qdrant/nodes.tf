@@ -1,5 +1,5 @@
 locals {
-  image = "${var.container_image}:v${var.qdrant_version}"
+  image = var.container_image_digest != null ? "${var.container_image}@${var.container_image_digest}" : "${var.container_image}:v${var.qdrant_version}"
 
   collection_defaults = {
     for k, v in {
@@ -59,6 +59,7 @@ locals {
     Restart=always
     RestartSec=10
     TimeoutStartSec=900
+    TimeoutStopSec=90
     ExecStartPre=/usr/local/bin/qdrant-prepare.sh
     ExecStartPre=-/usr/bin/docker rm -f qdrant
     ExecStart=/usr/local/bin/qdrant-run.sh
@@ -137,8 +138,9 @@ locals {
 
   user_data_plain = {
     for key, node in local.nodes : key => templatefile("${path.module}/templates/user_data.yaml.tftpl", {
-      monitoring = var.enable_monitoring
-      backups    = var.enable_backups
+      install_packages = var.bootstrap_install_packages
+      monitoring       = var.enable_monitoring
+      backups          = var.enable_backups
       files = concat(
         [
           {
@@ -157,6 +159,8 @@ locals {
             permissions = "0755"
             content = templatefile("${path.module}/templates/qdrant-run.sh.tftpl", {
               image        = local.image
+              ecr_login    = var.ecr_repository_arn != null
+              cached_image = var.require_cached_image
               region       = local.region
               log_group    = local.log_group_name
               node_name    = node.name
@@ -391,7 +395,7 @@ resource "aws_autoscaling_group" "node" {
 
   launch_template {
     id      = aws_launch_template.node[each.key].id
-    version = "$Latest"
+    version = tostring(aws_launch_template.node[each.key].latest_version)
   }
 
   dynamic "tag" {

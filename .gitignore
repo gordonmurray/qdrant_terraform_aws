@@ -13,8 +13,11 @@ override.tf.json
 *_override.tf.json
 .terraformrc
 terraform.rc
-# Lock files are generated per machine and platform.
-.terraform.lock.hcl
+# Commit provider lock files in deployment roots.
+/modules/qdrant/.terraform.lock.hcl
+/examples/shared/vpc/.terraform.lock.hcl
+*.tfplan.json
+__pycache__/
 
 # Editors / OS
 .idea/
@@ -25,3 +28,6 @@ terraform.rc
 # Saved plans can contain secrets
 *.tfplan
 tfplan
+
+# Local backend configuration
+backend.hcl

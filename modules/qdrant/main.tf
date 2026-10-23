@@ -32,8 +32,8 @@ locals {
     for i in local.node_indexes : tostring(i) => {
       index     = i
       name      = "${var.name}-${i}"
-      subnet_id = var.subnet_ids[i % length(var.subnet_ids)]
-      az        = data.aws_subnet.selected[i % length(var.subnet_ids)].availability_zone
+      subnet_id = lookup(var.node_subnet_ids, tostring(i), var.subnet_ids[i % length(var.subnet_ids)])
+      az        = data.aws_subnet.selected[index(var.subnet_ids, lookup(var.node_subnet_ids, tostring(i), var.subnet_ids[i % length(var.subnet_ids)]))].availability_zone
     }
   }
 
@@ -86,13 +86,6 @@ check "cluster_placement_single_az" {
   }
 }
 
-check "production_placement" {
-  assert {
-    condition     = !var.production_mode || var.node_count <= 3
-    error_message = "production_mode with more than 3 nodes: Qdrant does not place replicas by AZ, so two replicas of one shard can share an AZ. Verify per-shard AZ placement yourself, or use 3 nodes in 3 AZs with replication factor 3."
-  }
-}
-
 check "access_configured" {
   assert {
     condition     = length(var.allowed_cidr_blocks) + length(var.allowed_security_group_ids) > 0
@@ -107,8 +100,37 @@ resource "terraform_data" "production_guard" {
 
   lifecycle {
     precondition {
-      condition     = var.node_count >= 3
-      error_message = "production_mode needs node_count >= 3 so the Raft cluster survives losing a node."
+      condition     = length(var.node_subnet_ids) == var.node_count
+      error_message = "production_mode requires explicit node_subnet_ids. Preserve each existing node's subnet when migrating."
+    }
+
+    precondition {
+      condition     = local.effective_replication_factor == 3 && local.effective_write_consistency == 2
+      error_message = "production_mode requires replication factor 3 and write consistency 2."
+    }
+
+    precondition {
+      condition     = var.container_image_digest != null
+      error_message = "production_mode requires container_image_digest for reproducible replacements."
+    }
+
+    precondition {
+      condition     = var.nlb_hostname != null && !var.force_destroy_snapshot_bucket
+      error_message = "production_mode requires nlb_hostname and forbids force_destroy_snapshot_bucket."
+    }
+
+    precondition {
+      condition = alltrue([
+        try(var.qdrant_config_overrides.cluster.enabled, true) == true,
+        try(var.qdrant_config_overrides.storage.collection.replication_factor, 3) == 3,
+        try(var.qdrant_config_overrides.storage.collection.write_consistency_factor, 2) == 2,
+      ])
+      error_message = "Configuration overrides must preserve cluster mode, replication factor 3 and write consistency 2 in production."
+    }
+
+    precondition {
+      condition     = var.node_count == 3
+      error_message = "production_mode supports exactly three nodes across three AZs. Larger clusters need an AZ-aware replica placement procedure."
     }
 
     precondition {

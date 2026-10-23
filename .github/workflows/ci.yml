@@ -27,7 +27,7 @@ jobs:
       - name: Validate examples
         run: |
           for d in examples/single-node examples/cluster examples/production; do
-            (cd "$d" && terraform init -backend=false -input=false && terraform validate)
+            (cd "$d" && terraform init -backend=false -input=false -lockfile=readonly && terraform validate)
           done
 
   tflint:
@@ -44,8 +44,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: aquasecurity/trivy-action@0.28.0
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
+          version: v0.76.1
           scan-type: config
           scan-ref: .
           severity: HIGH,CRITICAL
@@ -66,4 +67,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
       - run: shellcheck scripts/*.sh
+      - name: Render and lint startup scripts
+        run: python3 tests/check_templates.py
+      - name: Test plan policy, replacement and client checks
+        run: python3 -m unittest discover -s tests -v

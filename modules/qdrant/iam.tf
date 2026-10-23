@@ -65,6 +65,20 @@ locals {
     ] : s if var.enable_backups],
     [for s in [
       {
+        Sid      = "EcrLogin"
+        Effect   = "Allow"
+        Action   = ["ecr:GetAuthorizationToken"]
+        Resource = "*"
+      },
+      {
+        Sid      = "PullQdrantImage"
+        Effect   = "Allow"
+        Action   = ["ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage"]
+        Resource = var.ecr_repository_arn
+      },
+    ] : s if var.ecr_repository_arn != null],
+    [for s in [
+      {
         Sid      = "UseCustomerManagedKey"
         Effect   = "Allow"
         Action   = ["kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"]

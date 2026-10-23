@@ -333,12 +333,15 @@ run "production_mode_accepts_three_nodes_in_three_azs" {
   command = plan
 
   variables {
-    production_mode     = true
-    node_count          = 3
-    ami_id              = "ami-0123456789abcdef0"
-    nlb_certificate_arn = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
-    alarm_email         = "oncall@example.com"
-    allowed_cidr_blocks = ["10.0.0.0/16"]
+    production_mode        = true
+    node_subnet_ids        = { "0" = "subnet-aaaa", "1" = "subnet-bbbb", "2" = "subnet-cccc" }
+    container_image_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    nlb_hostname           = "qdrant.example.com"
+    node_count             = 3
+    ami_id                 = "ami-0123456789abcdef0"
+    nlb_certificate_arn    = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    alarm_email            = "oncall@example.com"
+    allowed_cidr_blocks    = ["10.0.0.0/16"]
   }
 
   override_data {
@@ -360,18 +363,30 @@ run "production_mode_accepts_three_nodes_in_three_azs" {
     condition     = length(terraform_data.production_guard) == 1
     error_message = "The production guard should be active."
   }
+  assert {
+    condition     = aws_lb.this[0].enable_deletion_protection && aws_dynamodb_table.maintenance.deletion_protection_enabled
+    error_message = "Production must protect the load balancer and maintenance table from deletion."
+  }
+
+  assert {
+    condition     = local.image == "docker.io/qdrant/qdrant@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    error_message = "The image digest must override the mutable version tag."
+  }
 }
 
-run "production_mode_accepts_five_nodes_two_two_one" {
+run "production_mode_rejects_five_nodes" {
   command = plan
 
   variables {
-    production_mode     = true
-    node_count          = 5
-    ami_id              = "ami-0123456789abcdef0"
-    nlb_certificate_arn = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
-    alarm_email         = "oncall@example.com"
-    allowed_cidr_blocks = ["10.0.0.0/16"]
+    production_mode        = true
+    node_subnet_ids        = { "0" = "subnet-aaaa", "1" = "subnet-bbbb", "2" = "subnet-cccc", "3" = "subnet-aaaa", "4" = "subnet-bbbb" }
+    container_image_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    nlb_hostname           = "qdrant.example.com"
+    node_count             = 5
+    ami_id                 = "ami-0123456789abcdef0"
+    nlb_certificate_arn    = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    alarm_email            = "oncall@example.com"
+    allowed_cidr_blocks    = ["10.0.0.0/16"]
   }
 
   override_data {
@@ -389,8 +404,8 @@ run "production_mode_accepts_five_nodes_two_two_one" {
     values = { availability_zone = "eu-west-1c" }
   }
 
-  # The AZ rule passes; the placement caveat for more than 3 nodes is a warning.
-  expect_failures = [check.production_placement]
+  # Raft quorum alone does not guarantee per-shard AZ resilience.
+  expect_failures = [terraform_data.production_guard]
 
   assert {
     condition     = length(aws_autoscaling_group.node) == 5
@@ -402,11 +417,14 @@ run "production_mode_rejects_one_node" {
   command = plan
 
   variables {
-    production_mode     = true
-    ami_id              = "ami-0123456789abcdef0"
-    nlb_certificate_arn = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
-    alarm_email         = "oncall@example.com"
-    allowed_cidr_blocks = ["10.0.0.0/16"]
+    production_mode        = true
+    node_subnet_ids        = { "0" = "subnet-aaaa" }
+    container_image_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    nlb_hostname           = "qdrant.example.com"
+    ami_id                 = "ami-0123456789abcdef0"
+    nlb_certificate_arn    = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    alarm_email            = "oncall@example.com"
+    allowed_cidr_blocks    = ["10.0.0.0/16"]
   }
 
   expect_failures = [terraform_data.production_guard]
@@ -416,13 +434,16 @@ run "production_mode_rejects_three_nodes_in_two_azs" {
   command = plan
 
   variables {
-    production_mode     = true
-    node_count          = 3
-    subnet_ids          = ["subnet-aaaa", "subnet-bbbb"]
-    ami_id              = "ami-0123456789abcdef0"
-    nlb_certificate_arn = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
-    alarm_email         = "oncall@example.com"
-    allowed_cidr_blocks = ["10.0.0.0/16"]
+    production_mode        = true
+    node_subnet_ids        = { "0" = "subnet-aaaa", "1" = "subnet-bbbb", "2" = "subnet-aaaa" }
+    container_image_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    nlb_hostname           = "qdrant.example.com"
+    node_count             = 3
+    subnet_ids             = ["subnet-aaaa", "subnet-bbbb"]
+    ami_id                 = "ami-0123456789abcdef0"
+    nlb_certificate_arn    = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    alarm_email            = "oncall@example.com"
+    allowed_cidr_blocks    = ["10.0.0.0/16"]
   }
 
   override_data {
@@ -442,9 +463,12 @@ run "production_mode_rejects_missing_tls_alarm_and_ami" {
   command = plan
 
   variables {
-    production_mode     = true
-    node_count          = 3
-    allowed_cidr_blocks = ["10.0.0.0/16"]
+    production_mode        = true
+    node_subnet_ids        = { "0" = "subnet-aaaa", "1" = "subnet-bbbb", "2" = "subnet-cccc" }
+    container_image_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    nlb_hostname           = "qdrant.example.com"
+    node_count             = 3
+    allowed_cidr_blocks    = ["10.0.0.0/16"]
   }
 
   override_data {
@@ -493,4 +517,309 @@ run "metrics_off" {
     condition     = length(aws_cloudwatch_metric_alarm.file_descriptors) == 0 && length(aws_cloudwatch_metric_alarm.rest_latency) == 0
     error_message = "No Qdrant metric alarms when the metrics are disabled."
   }
+}
+run "rejects_single_replica" {
+  command = plan
+
+  variables {
+    default_replication_factor       = 1
+    default_write_consistency_factor = 1
+    production_mode                  = true
+    node_subnet_ids                  = { "0" = "subnet-aaaa", "1" = "subnet-bbbb", "2" = "subnet-cccc" }
+    container_image_digest           = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    nlb_hostname                     = "qdrant.example.com"
+    node_count                       = 3
+    ami_id                           = "ami-0123456789abcdef0"
+    nlb_certificate_arn              = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    alarm_email                      = "oncall@example.com"
+    allowed_cidr_blocks              = ["10.0.0.0/16"]
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[0]
+    values = { availability_zone = "eu-west-1a" }
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[1]
+    values = { availability_zone = "eu-west-1b" }
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[2]
+    values = { availability_zone = "eu-west-1c" }
+  }
+
+  expect_failures = [terraform_data.production_guard]
+}
+
+run "rejects_weak_write_consistency" {
+  command = plan
+
+  variables {
+    default_write_consistency_factor = 1
+    production_mode                  = true
+    node_subnet_ids                  = { "0" = "subnet-aaaa", "1" = "subnet-bbbb", "2" = "subnet-cccc" }
+    container_image_digest           = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    nlb_hostname                     = "qdrant.example.com"
+    node_count                       = 3
+    ami_id                           = "ami-0123456789abcdef0"
+    nlb_certificate_arn              = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    alarm_email                      = "oncall@example.com"
+    allowed_cidr_blocks              = ["10.0.0.0/16"]
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[0]
+    values = { availability_zone = "eu-west-1a" }
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[1]
+    values = { availability_zone = "eu-west-1b" }
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[2]
+    values = { availability_zone = "eu-west-1c" }
+  }
+
+  expect_failures = [terraform_data.production_guard]
+}
+
+run "rejects_forced_backup_deletion" {
+  command = plan
+
+  variables {
+    force_destroy_snapshot_bucket = true
+    production_mode               = true
+    node_subnet_ids               = { "0" = "subnet-aaaa", "1" = "subnet-bbbb", "2" = "subnet-cccc" }
+    container_image_digest        = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    nlb_hostname                  = "qdrant.example.com"
+    node_count                    = 3
+    ami_id                        = "ami-0123456789abcdef0"
+    nlb_certificate_arn           = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    alarm_email                   = "oncall@example.com"
+    allowed_cidr_blocks           = ["10.0.0.0/16"]
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[0]
+    values = { availability_zone = "eu-west-1a" }
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[1]
+    values = { availability_zone = "eu-west-1b" }
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[2]
+    values = { availability_zone = "eu-west-1c" }
+  }
+
+  expect_failures = [terraform_data.production_guard]
+}
+
+run "rejects_config_override_bypass" {
+  command = plan
+
+  variables {
+    qdrant_config_overrides = { storage = { collection = { replication_factor = 1 } } }
+    production_mode         = true
+    node_subnet_ids         = { "0" = "subnet-aaaa", "1" = "subnet-bbbb", "2" = "subnet-cccc" }
+    container_image_digest  = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    nlb_hostname            = "qdrant.example.com"
+    node_count              = 3
+    ami_id                  = "ami-0123456789abcdef0"
+    nlb_certificate_arn     = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    alarm_email             = "oncall@example.com"
+    allowed_cidr_blocks     = ["10.0.0.0/16"]
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[0]
+    values = { availability_zone = "eu-west-1a" }
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[1]
+    values = { availability_zone = "eu-west-1b" }
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[2]
+    values = { availability_zone = "eu-west-1c" }
+  }
+
+  expect_failures = [terraform_data.production_guard]
+}
+
+run "rejects_disabled_cluster" {
+  command = plan
+
+  variables {
+    qdrant_config_overrides = { cluster = { enabled = false } }
+    production_mode         = true
+    node_subnet_ids         = { "0" = "subnet-aaaa", "1" = "subnet-bbbb", "2" = "subnet-cccc" }
+    container_image_digest  = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    nlb_hostname            = "qdrant.example.com"
+    node_count              = 3
+    ami_id                  = "ami-0123456789abcdef0"
+    nlb_certificate_arn     = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    alarm_email             = "oncall@example.com"
+    allowed_cidr_blocks     = ["10.0.0.0/16"]
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[0]
+    values = { availability_zone = "eu-west-1a" }
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[1]
+    values = { availability_zone = "eu-west-1b" }
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[2]
+    values = { availability_zone = "eu-west-1c" }
+  }
+
+  expect_failures = [terraform_data.production_guard]
+}
+
+run "requires_digest" {
+  command = plan
+
+  variables {
+    production_mode     = true
+    node_subnet_ids     = { "0" = "subnet-aaaa", "1" = "subnet-bbbb", "2" = "subnet-cccc" }
+    nlb_hostname        = "qdrant.example.com"
+    node_count          = 3
+    ami_id              = "ami-0123456789abcdef0"
+    nlb_certificate_arn = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    alarm_email         = "oncall@example.com"
+    allowed_cidr_blocks = ["10.0.0.0/16"]
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[0]
+    values = { availability_zone = "eu-west-1a" }
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[1]
+    values = { availability_zone = "eu-west-1b" }
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[2]
+    values = { availability_zone = "eu-west-1c" }
+  }
+
+  expect_failures = [terraform_data.production_guard]
+}
+
+
+run "requires_explicit_placement" {
+  command = plan
+
+  variables {
+    production_mode        = true
+    container_image_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    nlb_hostname           = "qdrant.example.com"
+    node_count             = 3
+    ami_id                 = "ami-0123456789abcdef0"
+    nlb_certificate_arn    = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    alarm_email            = "oncall@example.com"
+    allowed_cidr_blocks    = ["10.0.0.0/16"]
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[0]
+    values = { availability_zone = "eu-west-1a" }
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[1]
+    values = { availability_zone = "eu-west-1b" }
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[2]
+    values = { availability_zone = "eu-west-1c" }
+  }
+
+  expect_failures = [terraform_data.production_guard]
+}
+
+
+run "requires_hostname" {
+  command = plan
+
+  variables {
+    production_mode        = true
+    node_subnet_ids        = { "0" = "subnet-aaaa", "1" = "subnet-bbbb", "2" = "subnet-cccc" }
+    container_image_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    node_count             = 3
+    ami_id                 = "ami-0123456789abcdef0"
+    nlb_certificate_arn    = "arn:aws:acm:eu-west-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    alarm_email            = "oncall@example.com"
+    allowed_cidr_blocks    = ["10.0.0.0/16"]
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[0]
+    values = { availability_zone = "eu-west-1a" }
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[1]
+    values = { availability_zone = "eu-west-1b" }
+  }
+
+  override_data {
+    target = data.aws_subnet.selected[2]
+    values = { availability_zone = "eu-west-1c" }
+  }
+
+  expect_failures = [terraform_data.production_guard]
+}
+
+
+run "explicit_placement_survives_subnet_reordering" {
+  command = plan
+  variables {
+    node_count          = 3
+    subnet_ids          = ["subnet-cccc", "subnet-aaaa", "subnet-bbbb"]
+    node_subnet_ids     = { "0" = "subnet-aaaa", "1" = "subnet-bbbb", "2" = "subnet-cccc" }
+    allowed_cidr_blocks = ["10.0.0.0/16"]
+  }
+  override_data {
+    target = data.aws_subnet.selected[0]
+    values = { availability_zone = "eu-west-1c" }
+  }
+  override_data {
+    target = data.aws_subnet.selected[1]
+    values = { availability_zone = "eu-west-1a" }
+  }
+  override_data {
+    target = data.aws_subnet.selected[2]
+    values = { availability_zone = "eu-west-1b" }
+  }
+  assert {
+    condition     = aws_network_interface.node["0"].subnet_id == "subnet-aaaa" && aws_ebs_volume.data["0"].availability_zone == "eu-west-1a" && aws_network_interface.node["1"].subnet_id == "subnet-bbbb" && aws_network_interface.node["2"].subnet_id == "subnet-cccc"
+    error_message = "Reordering the NLB subnet list must not move explicitly assigned nodes."
+  }
+}
+
+run "rejects_partial_node_mapping" {
+  command = plan
+  variables {
+    node_count          = 3
+    node_subnet_ids     = { "0" = "subnet-aaaa" }
+    allowed_cidr_blocks = ["10.0.0.0/16"]
+  }
+  expect_failures = [var.node_subnet_ids]
 }

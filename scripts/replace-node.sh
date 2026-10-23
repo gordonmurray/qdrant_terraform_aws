@@ -23,6 +23,14 @@
 #   ALLOW_SMALL_CLUSTER=1   Allow clusters with fewer than 3 peers (single node
 #                       replacement means downtime).
 #   ALLOW_SINGLE_REPLICA=1  Allow collections with replication factor 1.
+#   ALLOW_WRITE_UNAVAILABILITY=1  Allow replacing a node even if, while it is gone,
+#                       some shard would have fewer Active replicas than the
+#                       collection's write consistency factor (writes to it would fail).
+#   REPLACEMENT_LOCK_TABLE Required. Module maintenance_lock_table output.
+#   HEALTH_STABLE_SECONDS  Continuous healthy interval before the next node (default 60).
+#   QDRANT_TARGET_GROUP_ARNS Space-separated NLB target group ARNs.
+#                       All targets, including the replacement IP, must be healthy.
+#   ALLOW_NO_NLB_CHECK=1 Explicit opt-out for deployments without an NLB.
 #   HEALTH_TIMEOUT_MIN  Minutes to wait for the cluster to be healthy after each
 #                       replacement (default 30).
 #
@@ -51,15 +59,62 @@ fi
 : "${QDRANT_URL:?QDRANT_URL is required (the cluster endpoint)}"
 : "${QDRANT_API_KEY:?QDRANT_API_KEY is required}"
 export AWS_DEFAULT_REGION="$region"
+export AWS_PAGER=""
 timeout_min="${HEALTH_TIMEOUT_MIN:-30}"
+stable_seconds="${HEALTH_STABLE_SECONDS:-60}"
+: "${REPLACEMENT_LOCK_TABLE:?REPLACEMENT_LOCK_TABLE is required}"
+if [ -z "${QDRANT_TARGET_GROUP_ARNS:-}" ] && [ "${ALLOW_NO_NLB_CHECK:-0}" != 1 ]; then
+  echo "Set QDRANT_TARGET_GROUP_ARNS, or ALLOW_NO_NLB_CHECK=1 for a deployment without an NLB" >&2
+  exit 2
+fi
+[[ "$timeout_min" =~ ^[1-9][0-9]*$ && "$stable_seconds" =~ ^[0-9]+$ ]] || {
+  echo "Health timeouts must be non-negative whole seconds and positive whole minutes" >&2; exit 2;
+}
+
+# A non-expiring lock fails closed if the operator process is interrupted.
+# Do not release it on failure: the last replacement can still be in progress.
+lock_owner=$(python3 -c 'import uuid; print(uuid.uuid4())')
+locked=0
+report_lock() {
+  if [ "$locked" = 1 ]; then
+    echo "Maintenance lock retained in $REPLACEMENT_LOCK_TABLE (LockID=replacement, Owner=$lock_owner)." >&2
+    echo "Check all nodes and finish recovery before releasing it. See docs/production.md." >&2
+  fi
+}
+trap report_lock EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# All requested groups must belong to the deployment protected by this table.
+for asg in "${asgs[@]}"; do
+  # shellcheck disable=SC2016 # Backticks are JMESPath literals.
+  cluster=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$asg" \
+    --query 'AutoScalingGroups[0].Tags[?Key==`QdrantCluster`].Value | [0]' --output text)
+  if [ -z "$cluster" ] || [ "$cluster" = None ] || [ "$REPLACEMENT_LOCK_TABLE" != "$cluster-maintenance" ]; then
+    echo "ASG $asg does not belong to the deployment protected by $REPLACEMENT_LOCK_TABLE" >&2
+    exit 1
+  fi
+done
+
+aws dynamodb put-item --table-name "$REPLACEMENT_LOCK_TABLE" \
+  --item "$(jq -nc --arg owner "$lock_owner" --arg created "$(date -u +%FT%TZ)" \
+    '{LockID:{S:"replacement"},Owner:{S:$owner},CreatedAt:{S:$created}}')" \
+  --condition-expression 'attribute_not_exists(LockID)' >/dev/null
+locked=1
 
 api() { curl -fsS --max-time 30 -H "api-key: $QDRANT_API_KEY" "$QDRANT_URL$1"; }
 
 # Prints a human-readable problem and returns non-zero if the cluster is not
 # fully healthy: every peer present, every shard at its full replication factor
 # with all replicas Active, no collection running with a single replica.
+# With a first argument of "preflight" it also requires that the cluster can lose
+# one node: every shard must keep at least write_consistency_factor Active
+# replicas without it.
+# Note: this checks cluster membership and replica states as Qdrant reports them.
+# It cannot probe each node's readiness from outside the VPC; Qdrant only marks a
+# replica non-Active after it fails. Wait for the alarms to be clear as well.
 cluster_problem() {
-  local peers collections name path cfg rf sn
+  local mode="${1:-}" peers collections name path cfg rf wcf sn min_active
   curl -fsS --max-time 10 "$QDRANT_URL/readyz" >/dev/null 2>&1 || { echo "cluster endpoint is not ready"; return 1; }
 
   peers=$(api /cluster | jq -e '.result.peers | length') || { echo "cannot read cluster membership"; return 1; }
@@ -76,6 +131,7 @@ cluster_problem() {
     path=$(jq -rn --arg n "$name" '$n | @uri')
     cfg=$(api "/collections/$path") || { echo "cannot read collection $name"; return 1; }
     rf=$(jq -e '.result.config.params.replication_factor // 1' <<<"$cfg") || return 1
+    wcf=$(jq -e '.result.config.params.write_consistency_factor // 1' <<<"$cfg") || return 1
     sn=$(jq -e 'if .result.config.params.sharding_method == "custom" then 0 else (.result.config.params.shard_number // 0) end' <<<"$cfg") || return 1
     if [ "$rf" -lt 2 ] && [ "${ALLOW_SINGLE_REPLICA:-0}" != 1 ]; then
       echo "collection $name has replication factor $rf; replacing a node would make its data unavailable (set ALLOW_SINGLE_REPLICA=1 to accept that)"
@@ -90,6 +146,15 @@ cluster_problem() {
           | $present + $absent
         else error("no shard list") end') || { echo "cannot inspect shards of $name"; return 1; }
     [ "$deficit" -eq 0 ] || { echo "collection $name is $deficit replica(s) short of its replication factor"; return 1; }
+    if [ "$mode" = preflight ] && [ "${ALLOW_WRITE_UNAVAILABILITY:-0}" != 1 ]; then
+      min_active=$(api "/collections/$path/cluster" | jq -e '
+          [.result.local_shards[], (.result.remote_shards // [])[]]
+          | group_by(.shard_id) | map([.[] | select(.state == "Active")] | length) | min // 0') || { echo "cannot inspect shards of $name"; return 1; }
+      if [ $((min_active - 1)) -lt "$wcf" ]; then
+        echo "collection $name has a shard with only $min_active Active replica(s) and write consistency factor $wcf: while one node is replaced, writes to it would fail (set ALLOW_WRITE_UNAVAILABILITY=1 to accept that)"
+        return 1
+      fi
+    fi
   done <<<"$collections"
   return 0
 }
@@ -100,13 +165,39 @@ in_service_instance() {
     --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId | [0]' --output text
 }
 
+target_problem() {
+  local target_group states
+  for target_group in ${QDRANT_TARGET_GROUP_ARNS:-}; do
+    if ! states=$(aws elbv2 describe-target-health --target-group-arn "$target_group" --output json) ||
+       ! jq -e --arg ip "${1:-}" '.TargetHealthDescriptions |
+         length > 0 and all(.[]; .TargetHealth.State == "healthy") and
+         ($ip == "" or any(.[]; .Target.Id == $ip))' <<<"$states" >/dev/null; then
+      echo "NLB targets are not all healthy, or the replacement IP is absent, in $target_group"
+      return 1
+    fi
+  done
+}
+
 wait_healthy() {
-  local deadline problem
+  local deadline problem healthy_since=0 now
   deadline=$(( $(date +%s) + timeout_min * 60 ))
   while :; do
+    now=$(date +%s)
     if problem=$(cluster_problem); then
-      echo "Cluster is healthy."
-      return 0
+      # EC2 health alone does not prove that the replacement serves traffic.
+      problem=$(target_problem "$replacement_ip") || healthy_since=0
+      if [ -z "$problem" ]; then
+        [ "$healthy_since" -ne 0 ] || healthy_since=$now
+        if [ $((now - healthy_since)) -ge "$stable_seconds" ]; then
+          echo "Cluster has been healthy for $stable_seconds seconds."
+          return 0
+        fi
+        problem="waiting for $stable_seconds seconds of continuous health"
+      else
+        healthy_since=0
+      fi
+    else
+      healthy_since=0
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
       echo "Cluster did not become healthy within $timeout_min minutes: $problem" >&2
@@ -123,13 +214,27 @@ for asg in "${asgs[@]}"; do
   if [ "$skip_preflight" = 1 ]; then
     echo "Skipping preflight checks (--skip-preflight)."
   else
-    if ! problem=$(cluster_problem); then
+    if ! problem=$(cluster_problem preflight) || ! problem=$(target_problem); then
       echo "Preflight failed, not replacing $asg: $problem" >&2
       exit 1
     fi
     echo "Preflight passed."
   fi
 
+  template=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$asg" \
+    --query 'AutoScalingGroups[0].LaunchTemplate' --output json)
+  expected_template=$(jq -er '.LaunchTemplateId' <<<"$template")
+  expected_version=$(jq -er '.Version | select(test("^[0-9]+$"))' <<<"$template") || {
+    echo "ASG must select a numeric launch-template version. Apply the updated Terraform first." >&2
+    exit 1
+  }
+  replacement_ip=$(aws ec2 describe-network-interfaces \
+    --filters "Name=tag:Name,Values=$asg" "Name=tag:QdrantCluster,Values=$cluster" \
+    --query 'NetworkInterfaces[0].PrivateIpAddress' --output text)
+  if [ -z "$replacement_ip" ] || [ "$replacement_ip" = None ]; then
+    echo "Cannot find the stable ENI for $asg" >&2
+    exit 1
+  fi
   old_id=$(in_service_instance "$asg")
   if [ -z "$old_id" ] || [ "$old_id" = "None" ]; then
     echo "No in-service instance found in $asg" >&2
@@ -158,8 +263,22 @@ for asg in "${asgs[@]}"; do
   echo "Replacement is $new_id. Waiting for EC2 status checks..."
   aws ec2 wait instance-status-ok --instance-ids "$new_id"
 
+  actual_template=$(aws autoscaling describe-auto-scaling-instances --instance-ids "$new_id" \
+    --query 'AutoScalingInstances[0].LaunchTemplate' --output json)
+  if ! jq -e --arg id "$expected_template" --arg version "$expected_version" \
+    '.LaunchTemplateId == $id and (.Version | tostring) == $version' <<<"$actual_template" >/dev/null; then
+    echo "Replacement did not use the expected launch template $expected_template version $expected_version" >&2
+    exit 1
+  fi
+
   echo "Waiting for the cluster to be healthy again (peers present, replicas Active)..."
   wait_healthy || exit 1
 done
 
+aws dynamodb delete-item --table-name "$REPLACEMENT_LOCK_TABLE" \
+  --key '{"LockID":{"S":"replacement"}}' \
+  --condition-expression '#owner = :owner' \
+  --expression-attribute-names '{"#owner":"Owner"}' \
+  --expression-attribute-values "$(jq -nc --arg owner "$lock_owner" '{":owner":{S:$owner}}')"
+locked=0
 echo "All requested nodes replaced."

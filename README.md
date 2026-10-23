@@ -32,7 +32,7 @@ Each node is an EC2 instance with its own EBS volume, in its own AZ. Nodes talk 
 | Backups | Daily EBS snapshots (DLM) **and** daily Qdrant snapshots plus a manifest (collection configs, aliases, shard layout) to a versioned, encrypted S3 bucket, with a backup-age alarm |
 | Monitoring | CloudWatch agent (memory, disk, CPU), a per-node write/read/search canary, Qdrant's own request, latency and optimizer metrics, alarms (node down, canary, peers, replica deficit, CPU, memory, disk, file descriptors, backup age, unhealthy targets), SNS topic, dashboard, container logs |
 | Multi-tenancy | Options for JWT RBAC and strict-mode defaults, and a guide to shared collections, shard keys, tenant promotion and noisy neighbours ([docs/multitenancy.md](docs/multitenancy.md)) |
-| Production profile | `production_mode = true` enforces 3+ nodes spread so one AZ loss keeps quorum, TLS, backups, monitoring, an alarm destination and a pinned AMI ([docs/production.md](docs/production.md)) |
+| Production profile | `production_mode = true` enforces 3 nodes in distinct AZs, explicit placement, an image digest, TLS, backups, monitoring, an alarm destination and a pinned AMI ([docs/production.md](docs/production.md)) |
 | Cost | Plain On-Demand EC2, so Compute Savings Plans apply ([docs/savings-plans.md](docs/savings-plans.md)) |
 
 ## Layout
@@ -41,11 +41,13 @@ Each node is an EC2 instance with its own EBS volume, in its own AZ. Nodes talk 
 modules/qdrant/        the reusable module (inputs and outputs documented in its README)
 examples/single-node/  one node, cheapest way to learn
 examples/cluster/      three nodes across three AZs
-examples/production/   production_mode example (needs an ACM certificate, a pinned AMI, an SNS topic)
+examples/production/   production example (existing VPC, baked AMI and image digest, ACM certificate, SNS topic)
 examples/shared/vpc/   small VPC used by the examples (one NAT gateway)
 docs/                  production, multitenancy, scaling, backup and restore, operations, performance, Savings Plans
 scripts/               replace-node.sh: health-gated, serial instance replacement
 ```
+
+See [the production migration guide](docs/hardening-migration.md) for state locking, image preparation, plan checks, and maintenance locks.
 
 ## Quick start
 
@@ -159,7 +161,7 @@ Only the EC2 line is discounted by a Compute Savings Plan ([docs/savings-plans.m
 - **Backups are daily and per node.** Expect up to about a day of data loss in a total loss; cluster-wide recovery is a procedure to practise ([docs/backup-restore.md](docs/backup-restore.md)).
 - **No rolling updates from Terraform.** Launch template changes apply to the next instance replacement; use `scripts/replace-node.sh` one node at a time. This is deliberate, so a single apply cannot take the whole cluster down.
 - **Single-node downtime during replacement.** With `node_count = 1` there is a gap of a few minutes while the instance is replaced.
-- **Outbound internet needed** (NAT) for package install and the image pull unless you provide mirrors. Only Nitro instance types and anonymously pullable images are supported.
+- **Outbound internet needed** (NAT) for package install and image pulls unless you use a baked AMI or private mirrors. Only Nitro instance types are supported. Private ECR pulls and pre-cached images are supported.
 - **Some changes need a manual step.** Replacing a node's volume or ENI requires scaling its ASG to zero first ([docs/operations.md](docs/operations.md)).
 - **Self-managed means you own upgrades and incidents.** Read [docs/operations.md](docs/operations.md).
 - `terraform test` (mocked provider) covers plan-time behaviour only. Start-up scripts, node recovery and restores were tested on real AWS for the 3-node stack ([docs/production.md](docs/production.md#what-has-actually-been-tested)); repeat the drills in your own account.
