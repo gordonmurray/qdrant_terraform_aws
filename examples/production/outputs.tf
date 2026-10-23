@@ -17,3 +17,11 @@ output "node_private_ips" {
   description = "Stable private IP of each node."
   value       = module.qdrant.node_private_ips
 }
+
+output "maintenance_lock_table" {
+  value = module.qdrant.maintenance_lock_table
+}
+
+output "nlb_target_group_arns" {
+  value = module.qdrant.nlb_target_group_arns
+}

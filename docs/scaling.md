@@ -10,6 +10,8 @@ export QDRANT_API_KEY=$(aws secretsmanager get-secret-value --secret-id "$(terra
   --query SecretString --output text | jq -r .api_key)
 ```
 
+For node replacement, first configure the maintenance lock and target checks in [the migration guide](hardening-migration.md#replace-nodes).
+
 ## Plan shards before you need them
 
 `shard_number` is fixed when a collection is created. Pick it for the cluster you may grow into, not the one you have today. This advice is for an ordinary collection that spreads across all nodes. For many tenants, a custom-sharded collection, or a promoted tenant that sits on a **single** shard, adding nodes cannot split that shard, so read [multitenancy.md](multitenancy.md) first.

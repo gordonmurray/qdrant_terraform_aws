@@ -11,11 +11,20 @@ SELF_IP="${node_ip}"
 STATE_PARAM="${state_param}"
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+%{ if cached_image ~}
+  echo "Required image is absent from the AMI Docker cache: $IMAGE" >&2
+  exit 1
+%{ else ~}
+%{ if ecr_login ~}
+  registry="$${IMAGE%%/*}"
+  aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$registry"
+%{ endif ~}
   for attempt in 1 2 3 4 5; do
     docker pull "$IMAGE" && break
     [ "$attempt" = 5 ] && exit 1
     sleep 15
   done
+%{ endif ~}
 fi
 
 # Every node advertises its stable ENI address to the cluster.
@@ -122,6 +131,8 @@ started=$SECONDS
 rc=0
 docker run --rm --name qdrant \
   --network host \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
   --ulimit nofile=65535:65535 \
   --env-file /etc/qdrant/qdrant.env \
   --log-driver awslogs \

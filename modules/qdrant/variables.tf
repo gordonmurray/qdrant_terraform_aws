@@ -18,7 +18,7 @@ variable "vpc_id" {
 }
 
 variable "subnet_ids" {
-  description = "Private subnet IDs (with outbound internet access, e.g. via NAT) to place nodes in. Node `i` uses `subnet_ids[i % length(subnet_ids)]`, so pass one subnet per AZ for a multi-AZ cluster."
+  description = "Private subnet IDs (with outbound internet access, e.g. via NAT) to place nodes in. Without node_subnet_ids, node `i` uses `subnet_ids[i % length(subnet_ids)]`. Use explicit assignments for production."
   type        = list(string)
 
   validation {
@@ -43,7 +43,7 @@ variable "qdrant_version" {
 }
 
 variable "production_mode" {
-  description = "Turn the safety warnings into hard errors for a customer-facing deployment: at least 3 nodes spread so losing any one AZ keeps quorum, TLS on the NLB, backups and monitoring on, an alarm destination, a pinned `ami_id`, a final snapshot on destroy, and a 7-day secret recovery window. Also defaults new collections to replication factor 3 and write consistency 2. See docs/production.md."
+  description = "Turn the safety warnings into hard errors for a customer-facing deployment: exactly 3 nodes in distinct AZs with explicit subnet assignments and an immutable image digest, TLS on the NLB, backups and monitoring on, an alarm destination, a pinned `ami_id`, a final snapshot on destroy, and a 7-day secret recovery window. Requires replication factor 3 and write consistency 2 for new collection defaults. See docs/production.md."
   type        = bool
   default     = false
 }
@@ -83,7 +83,7 @@ variable "default_strict_mode_config" {
 }
 
 variable "container_image" {
-  description = "Container image repository, without tag. Must be pullable without authentication from the instances (a public registry or an open mirror). Private registries such as ECR need credentials that this module does not configure."
+  description = "Container image repository, without tag. Use ecr_repository_arn for private ECR authentication, or bake the image into the AMI."
   type        = string
   default     = "docker.io/qdrant/qdrant"
 }
@@ -408,4 +408,53 @@ variable "tags" {
   description = "Tags applied to all resources. Tag keys you use for cost allocation are inherited by instances and volumes."
   type        = map(string)
   default     = {}
+}
+
+variable "node_subnet_ids" {
+  description = "Explicit subnet assignment keyed by existing numeric node index. Supply every node to keep placement stable when subnet_ids is reordered. Subnets must also appear in subnet_ids."
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition = length(var.node_subnet_ids) == 0 || (
+      toset(keys(var.node_subnet_ids)) == toset([for i in range(var.node_count) : tostring(i)]) &&
+      alltrue([for id in values(var.node_subnet_ids) : contains(var.subnet_ids, id)])
+    )
+    error_message = "node_subnet_ids must contain exactly indices 0 through node_count-1, with values from subnet_ids."
+  }
+}
+
+variable "container_image_digest" {
+  description = "Optional immutable sha256 image digest. Overrides qdrant_version for image selection. Required in production mode."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.container_image_digest == null || can(regex("^sha256:[a-f0-9]{64}$", var.container_image_digest))
+    error_message = "container_image_digest must be sha256 followed by 64 lowercase hexadecimal characters."
+  }
+}
+
+variable "ecr_repository_arn" {
+  description = "Private ECR repository ARN for container_image. Enables registry login and grants pull access to this repository only. Use a repository in the deployment region."
+  type        = string
+  default     = null
+}
+
+variable "bootstrap_install_packages" {
+  description = "Install runtime packages during cloud-init. Set false for a tested AMI with Docker, AWS CLI, jq, XFS tools and the CloudWatch agent already installed."
+  type        = bool
+  default     = true
+}
+
+variable "require_cached_image" {
+  description = "Refuse to pull an image at boot. The selected image must already exist in the AMI Docker cache."
+  type        = bool
+  default     = false
+}
+
+variable "nlb_deletion_protection" {
+  description = "Protect the NLB from deletion. Null enables protection in production mode."
+  type        = bool
+  default     = null
 }

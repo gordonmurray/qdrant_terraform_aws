@@ -27,3 +27,11 @@ output "snapshot_bucket" {
   description = "S3 bucket with Qdrant snapshots."
   value       = module.qdrant.snapshot_bucket
 }
+
+output "maintenance_lock_table" {
+  value = module.qdrant.maintenance_lock_table
+}
+
+output "nlb_target_group_arns" {
+  value = module.qdrant.nlb_target_group_arns
+}

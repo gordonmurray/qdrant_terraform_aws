@@ -13,12 +13,22 @@ All notable changes are recorded here. The format follows [Keep a Changelog](htt
 
 ### Changed
 
+- Production mode now requires exactly three nodes in distinct AZs, explicit subnet assignments, an image digest, a TLS hostname, replication factor 3, and write consistency 2. Forced backup deletion and conflicting configuration overrides are rejected.
+- The production example now uses an existing network, an S3 backend, and a baked AMI with a cached image. See `docs/hardening-migration.md` before updating an existing deployment.
+- ASGs select numeric launch-template versions. Replacement requires an exclusive DynamoDB maintenance lock and checks the replacement version and sustained cluster health.
+- Production NLBs and maintenance tables enable deletion protection. Deployment roots commit provider lock files.
+- Containers drop capabilities and prevent privilege escalation.
+
 - `scripts/replace-node.sh` also refuses to replace a node if, while it is gone, some shard would have fewer Active replicas than its write consistency factor (override with `ALLOW_WRITE_UNAVAILABILITY=1`).
 - `docs/multitenancy.md`: point IDs must be integers or UUIDs generated on the server; ID-based operations need server-side ownership checks because they cannot carry a tenant filter; custom shard keys can have several shards and replicas on several nodes (only tiered fallback and promoted keys are single-shard); separate collections do not isolate CPU or I/O; promotion setup steps and keeping the fallback copy until replicas are verified.
 
 ### Added
 
-- `production_mode`: enforces 3+ nodes spread so losing any AZ keeps a Raft majority, TLS on the NLB, backups and monitoring, an alarm destination, a pinned AMI, final snapshots and a secret recovery window. Defaults new collections to replication factor 3 and write consistency 2.
+- Explicit `node_subnet_ids`, image digest selection, private ECR pulls, and optional offline bootstrap.
+- Saved-plan protection for persistent and network resources, with regression tests.
+- AMI preparation and HTTPS client-path scripts, rendered-template linting, and mocked replacement tests.
+
+- `production_mode`: enforces three nodes in distinct AZs so losing any AZ keeps a Raft majority, TLS on the NLB, backups and monitoring, an alarm destination, a pinned AMI, final snapshots and a secret recovery window. Defaults new collections to replication factor 3 and write consistency 2.
 - Safe node recovery: an empty node joins through any ready peer; only node 0 on a never-initialised cluster (SSM marker) may create one; otherwise it refuses to start.
 - Per-node canary (authenticated write, read and search), peer-count and inactive-replica alarms, and a backup-age alarm that measures elapsed time.
 - Snapshot manifests in S3 (collection configs, aliases, shard layout, peer IDs).

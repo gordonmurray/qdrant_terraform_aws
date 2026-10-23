@@ -70,6 +70,7 @@ No modules.
 | [aws_cloudwatch_metric_alarm.rest_latency](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm) | resource |
 | [aws_cloudwatch_metric_alarm.unhealthy_targets](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm) | resource |
 | [aws_dlm_lifecycle_policy.ebs](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/dlm_lifecycle_policy) | resource |
+| [aws_dynamodb_table.maintenance](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/dynamodb_table) | resource |
 | [aws_ebs_volume.data](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ebs_volume) | resource |
 | [aws_iam_instance_profile.node](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_instance_profile) | resource |
 | [aws_iam_role.dlm](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role) | resource |
@@ -121,7 +122,7 @@ No modules.
 | Name | Description | Type | Default | Required |
 |------|-------------|------|---------|:--------:|
 | name | Name of the Qdrant deployment. Used as a prefix for every resource and as the value of the `QdrantCluster` tag. | `string` | n/a | yes |
-| subnet\_ids | Private subnet IDs (with outbound internet access, e.g. via NAT) to place nodes in. Node `i` uses `subnet_ids[i % length(subnet_ids)]`, so pass one subnet per AZ for a multi-AZ cluster. | `list(string)` | n/a | yes |
+| subnet\_ids | Private subnet IDs (with outbound internet access, e.g. via NAT) to place nodes in. Without node\_subnet\_ids, node `i` uses `subnet_ids[i % length(subnet_ids)]`. Use explicit assignments for production. | `list(string)` | n/a | yes |
 | vpc\_id | ID of the VPC to deploy into. | `string` | n/a | yes |
 | alarm\_email | Email address to subscribe to the module-created SNS topic. Ignored when `alarm_sns_topic_arn` is set. The recipient must confirm the subscription. | `string` | `null` | no |
 | alarm\_sns\_kms\_key\_id | Customer managed KMS key ID, ARN or alias to encrypt the module-created SNS topic. The key policy must allow `cloudwatch.amazonaws.com` to use it. When null the topic is unencrypted, because CloudWatch cannot publish to a topic using the AWS managed SNS key. | `string` | `null` | no |
@@ -132,7 +133,9 @@ No modules.
 | api\_key\_secret\_arn | ARN of an existing Secrets Manager secret holding JSON `{"api_key": "...", "read_only_api_key": "..."}` (`read_only_api_key` is optional). When null, the module generates both keys and stores them in a new secret. Generated keys are kept in Terraform state, so use an encrypted remote backend. | `string` | `null` | no |
 | architecture | CPU architecture of the instance type: `arm64` (Graviton) or `x86_64`. Selects the Amazon Linux 2023 AMI. The Qdrant image is multi-arch. | `string` | `"arm64"` | no |
 | backup\_age\_alarm\_hours | Alarm when a node's last successful Qdrant snapshot is older than this many hours. The snapshot runs daily, so keep this above 24. | `number` | `26` | no |
-| container\_image | Container image repository, without tag. Must be pullable without authentication from the instances (a public registry or an open mirror). Private registries such as ECR need credentials that this module does not configure. | `string` | `"docker.io/qdrant/qdrant"` | no |
+| bootstrap\_install\_packages | Install runtime packages during cloud-init. Set false for a tested AMI with Docker, AWS CLI, jq, XFS tools and the CloudWatch agent already installed. | `bool` | `true` | no |
+| container\_image | Container image repository, without tag. Use ecr\_repository\_arn for private ECR authentication, or bake the image into the AMI. | `string` | `"docker.io/qdrant/qdrant"` | no |
+| container\_image\_digest | Optional immutable sha256 image digest. Overrides qdrant\_version for image selection. Required in production mode. | `string` | `null` | no |
 | cpu\_alarm\_threshold\_percent | CPU utilisation (percent) that triggers the CPU alarm. | `number` | `80` | no |
 | data\_volume\_iops | Provisioned IOPS of the data volume. gp3: 3000-16000, at most 500 per GiB. io2: 100-256000, at most 1000 per GiB; above 64000 needs an instance type that supports io2 Block Express. | `number` | `3000` | no |
 | data\_volume\_size\_gb | Size of each node's persistent data volume in GiB. Can be increased in place; it cannot be decreased. | `number` | `50` | no |
@@ -146,6 +149,7 @@ No modules.
 | disk\_alarm\_threshold\_percent | Data volume utilisation (percent) that triggers the disk alarm. | `number` | `80` | no |
 | ebs\_snapshot\_retention\_count | Number of daily EBS snapshots to keep per volume. | `number` | `7` | no |
 | ebs\_snapshot\_time\_utc | Time of day (UTC, HH:MM) for the daily EBS snapshot. | `string` | `"03:00"` | no |
+| ecr\_repository\_arn | Private ECR repository ARN for container\_image. Enables registry login and grants pull access to this repository only. Use a repository in the deployment region. | `string` | `null` | no |
 | enable\_backups | Enable EBS snapshots (Data Lifecycle Manager) and daily Qdrant snapshots to S3. | `bool` | `true` | no |
 | enable\_monitoring | Create CloudWatch alarms, a dashboard, and install the CloudWatch agent for memory and disk metrics. | `bool` | `true` | no |
 | enable\_nlb | Create an internal Network Load Balancer in front of the nodes. Client rules then apply to the NLB, and nodes only accept traffic from it. | `bool` | `true` | no |
@@ -160,14 +164,17 @@ No modules.
 | log\_retention\_days | Retention of the Qdrant container log group. Must be a value CloudWatch Logs accepts. | `number` | `30` | no |
 | memory\_alarm\_threshold\_percent | Memory utilisation (percent) that triggers the memory alarm. | `number` | `85` | no |
 | nlb\_certificate\_arn | ACM certificate ARN. When set, the NLB terminates TLS on ports 6333 and 6334 and forwards plain TCP to the nodes. When null, the NLB listeners are plain TCP. Node-to-node traffic is never encrypted by this module. | `string` | `null` | no |
+| nlb\_deletion\_protection | Protect the NLB from deletion. Null enables protection in production mode. | `bool` | `null` | no |
 | nlb\_hostname | DNS name that matches `nlb_certificate_arn` (for example `qdrant.example.com`). Create a DNS alias from it to the NLB yourself. When set, the `endpoint` and `grpc_endpoint` outputs use it instead of the AWS-generated NLB name, which a certificate cannot cover. | `string` | `null` | no |
 | node\_count | Number of Qdrant nodes. Qdrant always runs in cluster (Raft) mode, so you can grow from 1 later. Use 1 for experiments and 3 or more for fault tolerance; 2 nodes cannot keep Raft quorum if one fails. | `number` | `1` | no |
+| node\_subnet\_ids | Explicit subnet assignment keyed by existing numeric node index. Supply every node to keep placement stable when subnet\_ids is reordered. Subnets must also appear in subnet\_ids. | `map(string)` | `{}` | no |
 | placement\_group\_strategy | EC2 placement group for the nodes: `spread` puts each node on separate hardware (also works across AZs), `cluster` packs nodes together for the lowest network latency but only works when all nodes share one AZ, and null uses no placement group. A `cluster` group trades away AZ-level fault tolerance. | `string` | `null` | no |
-| production\_mode | Turn the safety warnings into hard errors for a customer-facing deployment: at least 3 nodes spread so losing any one AZ keeps quorum, TLS on the NLB, backups and monitoring on, an alarm destination, a pinned `ami_id`, a final snapshot on destroy, and a 7-day secret recovery window. Also defaults new collections to replication factor 3 and write consistency 2. See docs/production.md. | `bool` | `false` | no |
+| production\_mode | Turn the safety warnings into hard errors for a customer-facing deployment: exactly 3 nodes in distinct AZs with explicit subnet assignments and an immutable image digest, TLS on the NLB, backups and monitoring on, an alarm destination, a pinned `ami_id`, a final snapshot on destroy, and a 7-day secret recovery window. Requires replication factor 3 and write consistency 2 for new collection defaults. See docs/production.md. | `bool` | `false` | no |
 | qdrant\_config\_overrides | Extra Qdrant configuration, written to `config/local.yaml` and deep-merged over the module's own settings by Qdrant. Example: `{ storage = { performance = { max_search_threads = 4 } } }`. Do not put secrets here. | `any` | `{}` | no |
 | qdrant\_snapshot\_retention\_days | Days to keep Qdrant snapshots (and noncurrent versions) in S3. | `number` | `14` | no |
 | qdrant\_snapshot\_schedule | systemd `OnCalendar` expression for the daily Qdrant-native snapshot to S3 on each node. | `string` | `"*-*-* 02:00:00 UTC"` | no |
 | qdrant\_version | Qdrant image tag without the leading `v` (for example `1.20.0`). Pin an exact version; never use `latest`. | `string` | `"1.20.0"` | no |
+| require\_cached\_image | Refuse to pull an image at boot. The selected image must already exist in the AMI Docker cache. | `bool` | `false` | no |
 | root\_volume\_size\_gb | Size of each node's root volume in GiB. | `number` | `20` | no |
 | secret\_recovery\_window\_days | Recovery window for the generated secret. Use 0 to delete immediately on destroy (handy for throwaway environments). | `number` | `7` | no |
 | tags | Tags applied to all resources. Tag keys you use for cost allocation are inherited by instances and volumes. | `map(string)` | `{}` | no |
@@ -185,8 +192,10 @@ No modules.
 | grpc\_endpoint | Host:port for gRPC clients (NLB when enabled, otherwise node 0). |
 | iam\_role\_arn | ARN of the IAM role used by the Qdrant instances. |
 | log\_group\_name | CloudWatch log group receiving the Qdrant container logs. |
+| maintenance\_lock\_table | DynamoDB table for the exclusive replacement lock. Grant the operator GetItem, PutItem and DeleteItem on this table. |
 | nlb\_dns\_name | DNS name of the internal NLB, or null when `enable_nlb` is false. |
 | nlb\_security\_group\_id | Security group of the NLB, or null when `enable_nlb` is false. |
+| nlb\_target\_group\_arns | REST and gRPC target group ARNs for replacement health checks. |
 | node\_names | Name of each node (also the name of its Auto Scaling group), keyed by node index. |
 | node\_private\_ips | Stable private IP of each node, keyed by node index. |
 | security\_group\_id | Security group attached to the Qdrant nodes. Add it as a source in other security groups only if you want to trust the nodes. |

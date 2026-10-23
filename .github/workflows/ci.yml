@@ -27,7 +27,7 @@ jobs:
       - name: Validate examples
         run: |
           for d in examples/single-node examples/cluster examples/production; do
-            (cd "$d" && terraform init -backend=false -input=false && terraform validate)
+            (cd "$d" && terraform init -backend=false -input=false -lockfile=readonly && terraform validate)
           done
 
   tflint:
@@ -66,4 +66,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
       - run: shellcheck scripts/*.sh
+      - name: Render and lint startup scripts
+        run: python3 tests/check_templates.py
+      - name: Test plan policy, replacement and client checks
+        run: python3 -m unittest discover -s tests -v

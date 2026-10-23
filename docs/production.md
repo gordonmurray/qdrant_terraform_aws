@@ -2,14 +2,19 @@
 
 `production_mode = true` makes the module refuse unsafe setups. It is a floor, not a guarantee: read "What the module cannot promise" and run the drills below before customers depend on it. A reviewer who read this code rated the design a good foundation but not production-ready until recovery and alerting had been demonstrated, and this page is the result of that review.
 
+For existing deployments, read [the hardening migration guide](hardening-migration.md) before applying these changes.
+
 ## What `production_mode` enforces
 
 The plan fails (a precondition, not a warning) unless all of these hold:
 
 | Rule | Why |
 | --- | --- |
-| `node_count >= 3` | A Raft cluster needs a majority to change membership and keep writing |
-| No AZ holds more nodes than `node_count - majority` | Losing any one AZ must leave a majority. 3 nodes need 3 AZs. 5 nodes can be 2+2+1. 4 nodes need 4 AZs, which eu-west-1 does not have, so use 3 or 5 |
+| `node_count == 3` | The supported production topology has one node per AZ and one replica per node |
+| Three distinct AZs | Losing one AZ leaves two peers and two replicas of each shard |
+| Explicit `node_subnet_ids` | Reordering the NLB subnet list must not move nodes |
+| Image digest and replication defaults | An immutable image, replication factor 3, and write consistency 2 are required |
+| `nlb_hostname` and no forced bucket deletion | The client endpoint needs a certificate hostname and backups must survive accidental teardown |
 | `enable_nlb` and `nlb_certificate_arn` | Clients use TLS (`nlb_hostname` should be the DNS name the certificate covers) |
 | `enable_backups` and `enable_monitoring` | Backups, alarms and the canary are not optional |
 | `alarm_sns_topic_arn` or `alarm_email` | There must be somewhere for alarms to go. Prefer a topic wired to a pager |
@@ -17,7 +22,7 @@ The plan fails (a precondition, not a warning) unless all of these hold:
 | `final_snapshot_on_destroy` | A destroy keeps a last copy of each data volume |
 | Secret recovery window of at least 7 days | A deleted secret can be recovered |
 
-It also sets new collections to **replication factor 3 and write consistency 2** (a majority) through Qdrant's `storage.collection` defaults. Override with `default_replication_factor` and `default_write_consistency_factor`. These apply to collections created afterwards. **Existing collections keep their old settings**, and clients can still override per collection, so audit the real placement: every collection should show every shard with Active replicas on distinct nodes.
+It also sets new collections to **replication factor 3 and write consistency 2** (a majority) through Qdrant's `storage.collection` defaults. Production mode rejects other defaults and conflicting configuration overrides. These apply to collections created afterwards. **Existing collections keep their old settings**, and clients can still override per collection, so audit the real placement: every collection should show every shard with Active replicas on distinct nodes.
 
 See `examples/production` for a starting point.
 
@@ -46,20 +51,22 @@ Per node, every minute, a canary writes a point with a fresh nonce, reads it bac
 
 The canary uses a collection named `qdrant-canary`, visible in your cluster. The extra custom metrics add a small per-node CloudWatch cost.
 
-The canary runs on each node against itself. It does not test the customer path through the NLB and TLS. Add an external synthetic check (for example Route 53 health checks or your own monitoring) against `nlb_hostname`, and route all alarms to an on-call tool. An email address alone is not paging.
+The canary runs on each node against itself. It does not test the customer path through the NLB and TLS. Run `scripts/check-client.py` from the application network against `nlb_hostname`, and route all alarms to an on-call tool. An email address alone is not paging.
 
 ## What the module cannot promise
 
-- **Availability depends on how collections are created and where replicas land.** The replication default is only a default; enforce it in your application or provisioning code. Qdrant does not place replicas by AZ. The one topology where "survives losing an AZ" holds by construction is **3 nodes in 3 AZs with replication factor 3** (every shard on every node, write consistency 2). With 5 nodes, Raft keeps its majority if an AZ is lost, but two replicas of one shard can share an AZ, and losing that AZ can leave too few replicas for write consistency 2. If you use 5 nodes, verify and maintain per-shard AZ placement yourself. The module warns when production_mode has more than 3 nodes.
+- **Availability depends on how collections are created and where replicas land.** The replication default is only a default; enforce it in your application or provisioning code. Qdrant does not place replicas by AZ. The one topology where "survives losing an AZ" holds by construction is **3 nodes in 3 AZs with replication factor 3** (every shard on every node, write consistency 2). With 5 nodes, Raft keeps its majority if an AZ is lost, but two replicas of one shard can share an AZ, and losing that AZ can leave too few replicas for write consistency 2. If you use 5 nodes, verify and maintain per-shard AZ placement yourself. Production mode rejects more than three nodes.
 - **Terraform evaluates the AZ rule when subnet AZs are known.** With subnets that are created in the same apply, the check can move to apply time.
 - **Backups are daily and per node.** Expect up to about a day of data loss in a total loss. Cluster-wide recovery is a procedure you must practise, not a button.
-- **Start-up depends on outside services.** A new instance needs package repositories and the container registry. Every restart needs the EC2 API and Secrets Manager. During an unrelated outage a replacement can fail to start. Reduce this by pinning an AMI that already has Docker, using VPC endpoints for AWS APIs, and mirroring the image in a registry you control (the image must be anonymously pullable).
+- **Start-up depends on outside services.** By default, a new instance needs package repositories and the container registry. The production example instead requires a baked AMI. Every restart needs the EC2 API and Secrets Manager. During an unrelated outage a replacement can fail to start. Reduce this by pinning an AMI that already has Docker, using VPC endpoints for AWS APIs, and a cached image in the AMI or a private registry mirror. Private ECR authentication is supported.
 - **Node-to-node traffic is not encrypted.** TLS covers client to NLB only. If your commitments require encryption in transit end to end, you need more than this module.
 - **One AZ per node.** An AZ outage takes its node out until recovery. Replication across AZs keeps the service up.
-- **Terraform can replace several nodes' volumes in one plan** (for example a KMS key change or reordering `subnet_ids`). Before every apply, read the plan and look for `must be replaced` on more than one node's volume or ENI. Change one node at a time ([operations.md](operations.md)).
+- **Terraform can replace several nodes' volumes in one plan** (for example a KMS key change, or subnet reordering without explicit node assignments). Use `scripts/plan-production.sh` to reject destructive changes before apply. Read the saved plan. Change one node at a time ([operations.md](operations.md)).
 - **No automatic rebalancing.** See [scaling.md](scaling.md).
 
 ## What has actually been tested
+
+These results describe the earlier implementation. The new maintenance lock, baked-image path, and client check still need AWS staging drills.
 
 The module was deployed to AWS (eu-west-1, the `examples/cluster` 3-node stack with replication factor 3 and write consistency 2 collections) and exercised for a few hours. Results:
 

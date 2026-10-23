@@ -9,22 +9,22 @@ provider "aws" {
   }
 }
 
-# The example VPC has ONE NAT gateway. For production, bring your own network
-# (a NAT gateway per AZ, VPC endpoints) and pass its IDs to the module instead.
-module "network" {
-  source = "../shared/vpc"
-
-  name = "qdrant-prod"
-}
-
 module "qdrant" {
   source = "../../modules/qdrant"
 
   name       = "qdrant-prod"
-  vpc_id     = module.network.vpc_id
-  subnet_ids = module.network.private_subnet_ids # three AZs
+  vpc_id     = var.vpc_id
+  subnet_ids = var.subnet_ids
 
   production_mode = true
+  node_subnet_ids = var.node_subnet_ids
+
+  container_image              = var.container_image
+  container_image_digest       = var.container_image_digest
+  ecr_repository_arn           = var.ecr_repository_arn
+  bootstrap_install_packages   = false
+  require_cached_image         = true
+  disk_alarm_threshold_percent = 70
 
   node_count          = 3
   instance_type       = "r7g.xlarge"

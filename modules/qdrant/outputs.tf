@@ -74,3 +74,13 @@ output "iam_role_arn" {
   description = "ARN of the IAM role used by the Qdrant instances."
   value       = aws_iam_role.node.arn
 }
+
+output "maintenance_lock_table" {
+  description = "DynamoDB table for the exclusive replacement lock. Grant the operator GetItem, PutItem and DeleteItem on this table."
+  value       = aws_dynamodb_table.maintenance.name
+}
+
+output "nlb_target_group_arns" {
+  description = "REST and gRPC target group ARNs for replacement health checks."
+  value       = [for group in aws_lb_target_group.this : group.arn]
+}

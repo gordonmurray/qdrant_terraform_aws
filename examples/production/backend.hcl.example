@@ -1,0 +1,7 @@
+# Create this bucket and KMS key in a separate foundation stack.
+bucket       = "REPLACE-production-terraform-state"
+key          = "qdrant/production/terraform.tfstate"
+region       = "eu-west-1"
+encrypt      = true
+kms_key_id   = "REPLACE-state-kms-key-arn"
+use_lockfile = true
