@@ -1,0 +1,166 @@
+#!/bin/bash
+# Once a minute, against this node's own Qdrant with the real API key:
+#   - write a point with a fresh nonce, read it back and check the nonce,
+#   - search,
+#   - check cluster membership,
+#   - count replica deficit: for every shard of every collection, how many
+#     replicas short of the collection's replication factor (non-Active replicas
+#     and replicas that are missing altogether both count).
+# Any failure to inspect marks the canary failed. Unknown is never reported as
+# healthy.
+set -uo pipefail
+
+export AWS_DEFAULT_REGION="${region}"
+QDRANT_API_KEY=$(grep '^QDRANT__SERVICE__API_KEY=' /etc/qdrant/qdrant.env | cut -d= -f2-)
+
+BASE="http://127.0.0.1:${rest_port}"
+HEADER=(-H "api-key: $QDRANT_API_KEY")
+JSON=(-H 'Content-Type: application/json')
+CANARY="qdrant-canary"
+# Created with real redundancy so losing one node never takes part of the canary
+# (or the replace-node.sh health gate) down.
+POINT_ID=$((${node_index} + 1))
+ok=1
+peers=""
+ready_peers=""
+deficit=0
+inspected=1
+
+get() { curl -fsS --max-time 30 "$${HEADER[@]}" "$BASE$1"; }
+
+if list=$(get /collections) && jq -e '.result.collections | type == "array"' <<<"$list" >/dev/null; then
+  code=$(curl -s -o /dev/null -w '%%{http_code}' --max-time 10 "$${HEADER[@]}" "$BASE/collections/$CANARY")
+  if [ "$code" = 404 ]; then
+    curl -fsS --max-time 60 -X PUT "$${HEADER[@]}" "$${JSON[@]}" "$BASE/collections/$CANARY?timeout=30" \
+      -d '{"vectors": {"size": 4, "distance": "Dot"}, "shard_number": ${node_count}, "replication_factor": ${canary_replicas}}' >/dev/null || ok=0
+  elif [ "$code" != 200 ]; then
+    ok=0
+  fi
+
+  if [ "$ok" = 1 ]; then
+    nonce="$(date +%s)-$RANDOM"
+    curl -fsS --max-time 30 -X PUT "$${HEADER[@]}" "$${JSON[@]}" "$BASE/collections/$CANARY/points?wait=true" \
+      -d '{"points": [{"id": '"$POINT_ID"', "vector": [1, 0, 0, 0], "payload": {"nonce": "'"$nonce"'"}}]}' >/dev/null || ok=0
+    get "/collections/$CANARY/points/$POINT_ID" | jq -e --arg n "$nonce" '.result.payload.nonce == $n' >/dev/null || ok=0
+    # Query API (the older /points/search endpoints are deprecated).
+    curl -fsS --max-time 30 -X POST "$${HEADER[@]}" "$${JSON[@]}" "$BASE/collections/$CANARY/points/query" \
+      -d '{"query": [1, 0, 0, 0], "limit": 1}' | jq -e '.result.points | length == 1' >/dev/null || ok=0
+  fi
+
+  if cluster_json=$(get /cluster) && peers=$(jq -e '.result.peers | length' <<<"$cluster_json"); then
+    # Membership stays at full strength while a node is down, so also probe each
+    # other peer's readiness. A peer's address is host:p2p-port; its REST port is the
+    # same host. This node counts itself as ready (the canary has just used it).
+    ready_peers=1
+    self_id=$(jq -r '.result.peer_id' <<<"$cluster_json")
+    while IFS= read -r peer_host; do
+      [ -n "$peer_host" ] || continue
+      if curl -fsS --max-time 3 "http://$peer_host:${rest_port}/readyz" >/dev/null 2>&1; then
+        ready_peers=$((ready_peers + 1))
+      fi
+    done < <(jq -r --arg self "$self_id" '.result.peers | to_entries[] | select(.key != $self) | .value.uri | sub("^https?://"; "") | sub(":[0-9]+/?$"; "")' <<<"$cluster_json")
+  else
+    ok=0
+    peers=""
+  fi
+
+  names=$(jq -r '.result.collections[].name' <<<"$list") || { ok=0; names=""; }
+  while IFS= read -r collection; do
+    [ -n "$collection" ] || continue
+    path=$(jq -rn --arg n "$collection" '$n | @uri')
+    # Expected shape comes from the collection config; shards missing from the
+    # shard list entirely count as a full replication factor of missing replicas.
+    # Custom sharding (shard_number is per key) falls back to counting only the
+    # shards that are listed.
+    if ! cfg=$(get "/collections/$path") \
+      || ! rf=$(jq -e '.result.config.params.replication_factor // 1' <<<"$cfg") \
+      || ! sn=$(jq -e 'if .result.config.params.sharding_method == "custom" then 0 else (.result.config.params.shard_number // 0) end' <<<"$cfg") \
+      || ! d=$(get "/collections/$path/cluster" | jq -e --argjson rf "$rf" --argjson sn "$sn" '
+          if (.result.local_shards | type) == "array" then
+            [.result.local_shards[], (.result.remote_shards // [])[]] as $all
+            | ($all | group_by(.shard_id)) as $groups
+            | ($groups
+               | map(($rf - ([.[] | select(.state == "Active")] | length)) | if . > 0 then . else 0 end)
+               | add // 0) as $present
+            | (if $sn > ($groups | length) then ($sn - ($groups | length)) * $rf else 0 end) as $absent
+            | $present + $absent
+          else error("no shard list") end'); then
+      echo "Could not inspect replicas of $collection" >&2
+      ok=0
+      inspected=0
+    else
+      deficit=$((deficit + d))
+    fi
+  done <<<"$names"
+else
+  ok=0
+  inspected=0
+fi
+
+%{ if scrape_metrics ~}
+# Qdrant's own Prometheus metrics, curated and published to CloudWatch. Counters
+# are turned into per-minute rates from the previous run (a counter that went
+# down means Qdrant restarted, so the current value is used). A failed scrape
+# publishes nothing here and does not fail the canary.
+STATE_FILE=/run/qdrant-canary-counters
+if prom=$(curl -fsS --max-time 20 "$${HEADER[@]}" "$BASE/metrics") && [ -n "$prom" ]; then
+  psum() { awk -v m="$1" '$1 == m || index($1, m "{") == 1 { s += $NF } END { printf "%.6f", s + 0 }' <<<"$prom"; }
+  pmax() { awk -v m="$1" '($1 == m || index($1, m "{") == 1) && $NF + 0 > s { s = $NF + 0 } END { printf "%.6f", s + 0 }' <<<"$prom"; }
+
+  now=$(date +%s)
+  declare -A previous=()
+  prev_ts=0
+  if [ -f "$STATE_FILE" ]; then
+    while IFS='=' read -r key value; do
+      [ -n "$key" ] || continue
+      if [ "$key" = ts ]; then prev_ts=$value; else previous[$key]=$value; fi
+    done < "$STATE_FILE"
+  fi
+
+  metrics_json='[]'
+  add_metric() { # name value unit
+    metrics_json=$(jq -c --arg n "$1" --argjson v "$2" --arg u "$3" --arg c "${cluster_name}" --arg i "${node_index}" \
+      '. += [{MetricName: $n, Value: $v, Unit: $u, Dimensions: [{Name: "ClusterName", Value: $c}, {Name: "NodeIndex", Value: $i}]}]' <<<"$metrics_json")
+  }
+
+  new_state="ts=$now"$'\n'
+  elapsed=$((now - prev_ts))
+  for pair in rest_responses_total:RestRequestsPerMin rest_responses_fail_total:RestFailedResponsesPerMin \
+              grpc_responses_total:GrpcRequestsPerMin grpc_responses_fail_total:GrpcFailedResponsesPerMin; do
+    counter=$${pair%%:*}
+    metric=$${pair##*:}
+    current=$(psum "$counter")
+    new_state+="$counter=$current"$'\n'
+    if [ "$prev_ts" -gt 0 ] && [ "$elapsed" -gt 0 ] && [ -n "$${previous[$counter]:-}" ]; then
+      rate=$(awk -v c="$current" -v p="$${previous[$counter]}" -v e="$elapsed" 'BEGIN { d = c - p; if (d < 0) d = c; printf "%.4f", d / e * 60 }')
+      add_metric "$metric" "$rate" Count
+    fi
+  done
+  printf '%s' "$new_state" > "$STATE_FILE"
+
+  add_metric RestMaxLatencySeconds "$(pmax rest_responses_max_duration_seconds)" Seconds
+  add_metric RestAvgLatencySeconds "$(pmax rest_responses_avg_duration_seconds)" Seconds
+  add_metric GrpcMaxLatencySeconds "$(pmax grpc_responses_max_duration_seconds)" Seconds
+  add_metric PendingConsensusOperations "$(psum cluster_pending_operations_total)" Count
+  add_metric RunningOptimizations "$(psum collection_running_optimizations)" Count
+  add_metric DeadReplicas "$(psum collection_dead_replicas)" Count
+  add_metric TotalPoints "$(psum collection_points)" Count
+  add_metric Collections "$(psum collections_total)" Count
+  add_metric FileDescriptorUtilizationPercent \
+    "$(awk -v o="$(psum process_open_fds)" -v m="$(psum process_max_fds)" 'BEGIN { if (m > 0) printf "%.2f", o / m * 100; else print 0 }')" Percent
+
+  aws cloudwatch put-metric-data --namespace Qdrant --metric-data "$metrics_json" || echo "Could not publish Qdrant metrics" >&2
+fi
+
+%{ endif ~}
+dims="ClusterName=${cluster_name},NodeIndex=${node_index}"
+aws cloudwatch put-metric-data --namespace Qdrant --metric-name CanaryOK --value "$ok" --dimensions "$dims"
+# Unknown is never published as a healthy zero. When inspection failed, these
+# metrics are left out and the failed CanaryOK raises the alarm.
+if [ -n "$peers" ]; then
+  aws cloudwatch put-metric-data --namespace Qdrant --metric-name PeerCount --value "$peers" --dimensions "$dims"
+  aws cloudwatch put-metric-data --namespace Qdrant --metric-name ReadyPeers --value "$ready_peers" --dimensions "$dims"
+fi
+if [ "$inspected" = 1 ]; then
+  aws cloudwatch put-metric-data --namespace Qdrant --metric-name ReplicaDeficit --value "$deficit" --dimensions "$dims"
+fi

@@ -1,0 +1,33 @@
+#cloud-config
+# Rendered by the qdrant Terraform module. The whole document is gzipped by
+# Terraform to stay under the 16 KB user data limit.
+package_update: false
+
+write_files:
+%{ for f in files ~}
+  - path: ${f.path}
+    permissions: "${f.permissions}"
+    owner: root:root
+    content: |
+      ${indent(6, f.content)}
+%{ endfor ~}
+
+runcmd:
+  # The network (NAT) can lag behind instance launch, so retry the install.
+  - |
+    for attempt in $(seq 1 20); do
+      dnf install -y docker jq xfsprogs%{ if monitoring } amazon-cloudwatch-agent%{ endif } && break
+      sleep 15
+    done
+  - sysctl --system
+  - systemctl daemon-reload
+  - systemctl enable --now docker
+%{ if monitoring ~}
+  - /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/qdrant.json -s
+  - systemctl enable --now qdrant-canary.timer
+%{ endif ~}
+  - systemctl enable --now qdrant.service
+%{ if backups ~}
+  - systemctl enable --now qdrant-snapshot.timer
+  - systemctl enable --now qdrant-backup-age.timer
+%{ endif ~}

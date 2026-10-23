@@ -1,0 +1,18 @@
+#!/bin/bash
+# Publishes the age (hours) of this node's last successful Qdrant snapshot every
+# few minutes, so the alarm is a real elapsed-time watchdog. The stamp lives on
+# the data volume and survives instance replacement. On first sight the stamp is
+# initialised to "now", so the alarm only fires after a full alarm window passes
+# without a success.
+set -uo pipefail
+
+export AWS_DEFAULT_REGION="${region}"
+STAMP="${data_mount}/last-snapshot-success"
+
+mountpoint -q "${data_mount}" || exit 0
+[ -f "$STAMP" ] || date +%s > "$STAMP"
+
+age_hours=$(awk -v now="$(date +%s)" -v then="$(cat "$STAMP")" 'BEGIN { printf "%.2f", (now - then) / 3600 }')
+
+aws cloudwatch put-metric-data --namespace Qdrant --metric-name BackupAgeHours \
+  --value "$age_hours" --dimensions ClusterName=${cluster_name},NodeIndex=${node_index}

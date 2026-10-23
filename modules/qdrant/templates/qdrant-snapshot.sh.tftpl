@@ -1,0 +1,76 @@
+#!/bin/bash
+# Creates a Qdrant snapshot of every collection's local shards on this node.
+# Qdrant uploads them to S3 (storage.snapshots_config). A manifest describing
+# what was captured (collection configs, aliases, shard layout, peer IDs) is
+# uploaded next to them, a CloudWatch metric records the outcome, and a stamp on
+# the data volume records the last full success for the backup-age alarm.
+set -uo pipefail
+
+export AWS_DEFAULT_REGION="${region}"
+# Read the key as data; never source the env file (it is Docker --env-file syntax).
+QDRANT_API_KEY=$(grep '^QDRANT__SERVICE__API_KEY=' /etc/qdrant/qdrant.env | cut -d= -f2-)
+
+BASE="http://127.0.0.1:${rest_port}"
+HEADER=(-H "api-key: $QDRANT_API_KEY")
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+ok=1
+
+get() { curl -fsS --max-time 60 "$${HEADER[@]}" "$BASE$1"; }
+enc() { jq -rn --arg n "$1" '$n | @uri'; }
+
+manifest=$(jq -n --arg cluster "${cluster_name}" --argjson node ${node_index} --arg ts "$TS" \
+  '{cluster: $cluster, node: $node, timestamp: $ts, collections: []}')
+
+cluster_info=$(get /cluster) || { ok=0; cluster_info='{"result":null}'; }
+manifest=$(jq --argjson c "$cluster_info" '.cluster_info = $c.result' <<<"$manifest")
+
+# Capture and validate the collection list before using it. An error here must
+# never look like "no collections", or an empty backup would count as success.
+collections=()
+if list=$(get /collections) && jq -e '.result.collections | type == "array"' <<<"$list" >/dev/null; then
+  names=$(jq -r '.result.collections[].name' <<<"$list")
+  if [ -n "$names" ]; then
+    mapfile -t collections <<<"$names"
+  fi
+else
+  echo "Could not list collections" >&2
+  ok=0
+fi
+
+for collection in "$${collections[@]}"; do
+  [ -n "$collection" ] || continue
+  path=$(enc "$collection")
+  if response=$(curl -fsS -X POST "$${HEADER[@]}" "$BASE/collections/$path/snapshots?wait=true"); then
+    snapshot=$(jq -r '.result.name' <<<"$response")
+  else
+    echo "Snapshot failed for collection $collection" >&2
+    ok=0
+    snapshot=""
+  fi
+  config=$(get "/collections/$path" | jq '.result') || { ok=0; config=null; }
+  shards=$(get "/collections/$path/cluster" | jq '.result') || { ok=0; shards=null; }
+  manifest=$(jq --arg name "$collection" --arg snap "$snapshot" --argjson config "$config" --argjson shards "$shards" \
+    '.collections += [{name: $name, snapshot: $snap, config: $config, shards: $shards}]' <<<"$manifest")
+done
+
+aliases=$(get /aliases | jq '.result') || { ok=0; aliases=null; }
+manifest=$(jq --argjson a "$aliases" '.aliases = $a' <<<"$manifest")
+
+if ! jq -e '.collections | type == "array"' <<<"$manifest" >/dev/null; then
+  echo "Manifest is invalid" >&2
+  ok=0
+fi
+
+if [ "$ok" = 1 ] && ! echo "$manifest" | aws s3 cp - "s3://${bucket}/${cluster_name}/manifests/node-${node_index}/$TS.json" >/dev/null; then
+  echo "Manifest upload failed" >&2
+  ok=0
+fi
+
+if [ "$ok" = 1 ]; then
+  date +%s > "${data_mount}/last-snapshot-success"
+fi
+
+aws cloudwatch put-metric-data --namespace Qdrant --metric-name SnapshotSuccess \
+  --value "$ok" --dimensions ClusterName=${cluster_name},NodeIndex=${node_index}
+
+[ "$ok" = 1 ]

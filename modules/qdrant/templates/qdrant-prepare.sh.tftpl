@@ -1,0 +1,95 @@
+#!/bin/bash
+# Runs before every Qdrant start (see qdrant.service). Idempotent: it attaches
+# this node's ENI and data volume, mounts the volume, and refreshes API keys.
+set -euo pipefail
+
+export AWS_DEFAULT_REGION="${region}"
+VOLUME_ID="${volume_id}"
+ENI_ID="${eni_id}"
+MOUNT="${data_mount}"
+SECRET_ARN="${secret_arn}"
+
+TOKEN=$(curl -sS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
+INSTANCE_ID=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+
+# Attach a resource that can only be used by one instance at a time. After an
+# instance replacement the previous holder can still be shutting down, so retry.
+attach() {
+  local kind="$1" holder
+  for _ in $(seq 1 60); do
+    if [ "$kind" = eni ]; then
+      holder=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI_ID" \
+        --query 'NetworkInterfaces[0].Attachment.InstanceId' --output text)
+    else
+      holder=$(aws ec2 describe-volumes --volume-ids "$VOLUME_ID" \
+        --query 'Volumes[0].Attachments[0].InstanceId' --output text)
+    fi
+    if [ "$holder" = "$INSTANCE_ID" ]; then
+      return 0
+    fi
+    if [ "$holder" = "None" ]; then
+      if [ "$kind" = eni ]; then
+        aws ec2 attach-network-interface --network-interface-id "$ENI_ID" \
+          --instance-id "$INSTANCE_ID" --device-index 1 >/dev/null || true
+      else
+        aws ec2 attach-volume --volume-id "$VOLUME_ID" \
+          --instance-id "$INSTANCE_ID" --device /dev/sdf >/dev/null || true
+      fi
+    fi
+    sleep 10
+  done
+  echo "Timed out attaching $kind" >&2
+  return 1
+}
+
+attach eni
+attach volume
+
+DEVICE="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$(echo "$VOLUME_ID" | tr -d '-')"
+for _ in $(seq 1 60); do
+  [ -e "$DEVICE" ] && break
+  sleep 2
+done
+[ -e "$DEVICE" ] || { echo "Device $DEVICE did not appear" >&2; exit 1; }
+
+# Format only a brand-new, empty volume.
+if ! blkid "$DEVICE" >/dev/null 2>&1; then
+  mkfs.xfs -L qdrant "$DEVICE"
+fi
+mkdir -p "$MOUNT"
+mountpoint -q "$MOUNT" || mount -o noatime "$DEVICE" "$MOUNT"
+# Picks up an increased volume size; a no-op otherwise.
+xfs_growfs "$MOUNT" >/dev/null
+mkdir -p "$MOUNT/storage" "$MOUNT/snapshots"
+
+# API keys never appear in user-data; they are fetched here and kept root-only.
+# Every value is validated first: Qdrant treats an empty key as "no key", which
+# would silently turn authentication off.
+SECRET=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --query SecretString --output text)
+
+secret_field() {
+  local value
+  value=$(echo "$SECRET" | jq -r --arg f "$1" '.[$f] // empty')
+  if [ -n "$value" ] && ! [[ "$value" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
+    echo "Secret field $1 contains characters outside [A-Za-z0-9._~+/=-]" >&2
+    exit 1
+  fi
+  echo "$value"
+}
+
+API_KEY=$(secret_field api_key)
+READ_ONLY_KEY=$(secret_field read_only_api_key)
+ALT_KEY=$(secret_field alt_api_key)
+if [ -z "$API_KEY" ]; then
+  echo "Secret has no non-empty api_key; refusing to start without authentication" >&2
+  exit 1
+fi
+
+umask 077
+mkdir -p /etc/qdrant
+{
+  echo "QDRANT__SERVICE__API_KEY=$API_KEY"
+  [ -z "$READ_ONLY_KEY" ] || echo "QDRANT__SERVICE__READ_ONLY_API_KEY=$READ_ONLY_KEY"
+  [ -z "$ALT_KEY" ] || echo "QDRANT__SERVICE__ALT_API_KEY=$ALT_KEY"
+} > /etc/qdrant/qdrant.env.tmp
+mv /etc/qdrant/qdrant.env.tmp /etc/qdrant/qdrant.env

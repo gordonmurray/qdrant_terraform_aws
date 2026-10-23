@@ -1,0 +1,150 @@
+#!/bin/bash
+# Starts the Qdrant container in the foreground (supervised by systemd).
+set -euo pipefail
+
+export AWS_DEFAULT_REGION="${region}"
+IMAGE="${image}"
+MOUNT="${data_mount}"
+CLUSTER_NAME="${cluster_name}"
+NODE_INDEX="${node_index}"
+SELF_IP="${node_ip}"
+STATE_PARAM="${state_param}"
+
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  for attempt in 1 2 3 4 5; do
+    docker pull "$IMAGE" && break
+    [ "$attempt" = 5 ] && exit 1
+    sleep 15
+  done
+fi
+
+# Every node advertises its stable ENI address to the cluster.
+ARGS=(--uri "http://$SELF_IP:${p2p_port}")
+
+# Cluster state in SSM: "uninitialized" (never created), "creating" (node 0 has
+# been given permission to create it), "initialized" (a node reached ready).
+# "unknown" means SSM could not be read, which only matters for empty storage.
+state=$(aws ssm get-parameter --name "$STATE_PARAM" --query Parameter.Value --output text 2>/dev/null) || state=unknown
+
+# Echoes the IP of a ready peer other than this node, or nothing.
+ready_peer() {
+  local peers ip
+  peers=$(aws ec2 describe-network-interfaces \
+    --filters "Name=tag:QdrantCluster,Values=$CLUSTER_NAME" \
+    --query 'NetworkInterfaces[].PrivateIpAddress' --output text)
+  for ip in $peers; do
+    [ "$ip" = "$SELF_IP" ] && continue
+    if curl -fsS --max-time 3 "http://$ip:${rest_port}/readyz" >/dev/null 2>&1; then
+      echo "$ip"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# A node with existing Raft state rejoins from it. A node with EMPTY storage
+# (new cluster, or a replacement whose volume was lost) must join an existing
+# cluster through a ready peer. Only node 0 may create a brand-new cluster, and
+# only while the state is "uninitialized"; that permission is consumed (state set
+# to "creating") BEFORE the cluster is created, so a crash or a lost volume later
+# can never trigger a second creation. Anything else fails closed.
+fresh_start=0
+if [ ! -f "$MOUNT/storage/raft_state.json" ]; then
+  fresh_start=1
+  attempts=12
+  if [ "$NODE_INDEX" = 0 ] && [ "$state" = uninitialized ]; then
+    attempts=1
+  fi
+
+  joined=""
+  for _ in $(seq 1 "$attempts"); do
+    peer=$(ready_peer)
+    if [ -n "$peer" ]; then
+      ARGS+=(--bootstrap "http://$peer:${p2p_port}")
+      joined=1
+      break
+    fi
+    sleep 10
+  done
+
+  if [ -z "$joined" ]; then
+    if [ "$NODE_INDEX" = 0 ] && [ "$state" = uninitialized ]; then
+      # set -e makes a failed write abort here, before anything is created.
+      aws ssm put-parameter --name "$STATE_PARAM" --value creating --overwrite >/dev/null
+      echo "No cluster exists yet: node 0 is creating it."
+    else
+      echo "Storage is empty and no ready peer was found. Refusing to start a new cluster (state=$state)." >&2
+      if [ "$state" = creating ]; then
+        echo "State is 'creating': an earlier initialisation did not finish. If you are certain no cluster holds data, set $STATE_PARAM to 'uninitialized'; if one does, set it to 'initialized' and restore a peer." >&2
+      fi
+      exit 1
+    fi
+  fi
+fi
+
+# Existing Raft state that lists only this node, in a cluster that has been
+# initialised, while another node is ready, is a standalone fragment: for example
+# a join that failed half way, or a copy of an old single-node state. Starting it
+# would serve an empty, separate cluster behind the load balancer. Refuse, and
+# let an operator wipe the storage directory so the node joins the real cluster.
+if [ -f "$MOUNT/storage/raft_state.json" ] && [ "$state" = initialized ]; then
+  known=$(jq '.peer_address_by_id | length' "$MOUNT/storage/raft_state.json" 2>/dev/null || echo 0)
+  if [ "$known" -le 1 ] && [ -n "$(ready_peer)" ]; then
+    echo "Raft state lists only this node but the cluster is initialised and another node is ready. Refusing to start a standalone cluster. If this node holds no data you need, empty $MOUNT/storage and restart so it rejoins the cluster." >&2
+    exit 1
+  fi
+fi
+
+rm -f /run/qdrant-ready-seen
+
+# Once ready, note it (used below) and record that the cluster exists. The
+# write retries until it succeeds, so a transient SSM failure does not leave the
+# state stale.
+(
+  until curl -fsS --max-time 3 "http://127.0.0.1:${rest_port}/readyz" >/dev/null 2>&1; do
+    sleep 10
+  done
+  touch /run/qdrant-ready-seen
+  if [ "$state" != initialized ]; then
+    until aws ssm put-parameter --name "$STATE_PARAM" --value initialized --overwrite >/dev/null 2>&1; do
+      sleep 30
+    done
+  fi
+) >/dev/null 2>&1 &
+BACKGROUND_PID=$!
+
+LOCAL_CONFIG=()
+if [ -s /etc/qdrant/local.yaml ]; then
+  LOCAL_CONFIG=(-v /etc/qdrant/local.yaml:/qdrant/config/local.yaml:ro)
+fi
+
+started=$SECONDS
+rc=0
+docker run --rm --name qdrant \
+  --network host \
+  --ulimit nofile=65535:65535 \
+  --env-file /etc/qdrant/qdrant.env \
+  --log-driver awslogs \
+  --log-opt mode=non-blocking \
+  --log-opt max-buffer-size=25m \
+  --log-opt awslogs-region=${region} \
+  --log-opt awslogs-group=${log_group} \
+  --log-opt awslogs-stream=${node_name} \
+  -v "$MOUNT/storage:/qdrant/storage" \
+  -v "$MOUNT/snapshots:/qdrant/snapshots" \
+  -v /etc/qdrant/production.yaml:/qdrant/config/production.yaml:ro \
+  "$${LOCAL_CONFIG[@]}" \
+  "$IMAGE" ./qdrant "$${ARGS[@]}" || rc=$?
+
+kill "$BACKGROUND_PID" 2>/dev/null || true
+
+# A fresh start (storage was empty) that failed before the node ever became ready
+# left a partial state behind, for example a join that was rejected. Storage held
+# nothing when we started, so clear it, or the next start would mistake the
+# fragment for a real node and come up as a separate cluster.
+if [ "$fresh_start" = 1 ] && [ "$rc" != 0 ] && [ ! -f /run/qdrant-ready-seen ] && [ $((SECONDS - started)) -lt 300 ]; then
+  echo "Fresh start failed before becoming ready (exit $rc); clearing the partial state so the next attempt starts clean." >&2
+  find "$MOUNT/storage" -mindepth 1 -delete
+fi
+
+exit "$rc"

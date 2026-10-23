@@ -1,0 +1,27 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+# Lock files are generated per machine and platform.
+.terraform.lock.hcl
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Saved plans can contain secrets
+*.tfplan
+tfplan
